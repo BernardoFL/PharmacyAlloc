@@ -7,54 +7,19 @@ from functools import partial
 from scipy.cluster.hierarchy import dendrogram, linkage
 from scipy.spatial.distance import pdist, squareform
 from dataloader import load_data
-from GPVarInf import condition_similarity_vectorized
+import sys
+sys.setrecursionlimit(100000) #don't like this but it's necessary for the dendrogram function
 
-def compute_similarity_chunk(args):
-    """Helper function to compute similarities for a chunk of condition pairs"""
-    condition_pairs, condition_list = args
-    results = []
-    for i, j in condition_pairs:
-        sim = condition_similarity_vectorized(condition_list[i], condition_list[j])
-        results.append((i, j, sim.item()))
-    return results
+def similarity_to_distance(similarity_matrix):
+    
 
-def compute_condition_distance_matrix(condition_list):
-    """
-    Parallel computation of condition distances based on drug ATC codes.
-    """
-    n_conditions = len(condition_list)
-    similarity_matrix = torch.zeros((n_conditions, n_conditions))
-    
-    # Generate all pairs of indices
-    pairs = list(combinations(range(n_conditions), 2))
-    
-    # Split pairs into chunks for parallel processing
-    n_cores = mp.cpu_count()
-    chunk_size = max(1, len(pairs) // (n_cores * 4))
-    chunks = [pairs[i:i + chunk_size] for i in range(0, len(pairs), chunk_size)]
-    
-    # Prepare arguments for parallel processing
-    args = [(chunk, condition_list) for chunk in chunks]
-    
-    # Compute similarities in parallel
-    with mp.Pool(n_cores) as pool:
-        results = pool.map(compute_similarity_chunk, args)
-    
-    # Combine results
-    for chunk_results in results:
-        for i, j, sim in chunk_results:
-            similarity_matrix[i, j] = sim
-            similarity_matrix[j, i] = sim
-    
-    # Set diagonal to maximum similarity (self-similarity)
-    torch.diagonal(similarity_matrix).fill_(similarity_matrix.max())
-    
-    # Convert similarities to distances and ensure diagonal is 0
     max_sim = similarity_matrix.max()
     distance_matrix = max_sim - similarity_matrix
-    torch.diagonal(distance_matrix).fill_(0.0)
-    
+
+    np.fill_diagonal(distance_matrix, 0.0)
     return distance_matrix
+
+
 
 def get_ordering_indices():
     """
@@ -67,20 +32,38 @@ def get_ordering_indices():
     # Filter matrix A to only include first visits
     # Assuming A is organized as [patients x conditions]
     patients_per_visit = len(condition_list)
-    A_first_visit = A[:patients_per_visit]
-    X_cov_first_visit = X_cov[:patients_per_visit]
-    
+    A_first_visit = A[:,:,0]
+    X_cov_first_visit = X_cov[:,:,0]
+
+    condition_kernel_matrix = np.load("Data/condition_kernel_matrix.npz")
+    condition_kernel_matrix = condition_kernel_matrix['kernel_matrix']
+    condition_kernel_matrix = similarity_to_distance(condition_kernel_matrix)
+
     print(f"Number of unique conditions: {len(condition_list)}")
     print(f"Number of patients (first visit only): {A_first_visit.shape[0]}")
     
     # Compute condition distances and perform hierarchical clustering
-    condition_dist_matrix = compute_condition_distance_matrix(condition_list)
-    condition_linkage = linkage(squareform(condition_dist_matrix), method='ward')
+    condition_linkage = linkage(squareform(condition_kernel_matrix), method='ward')
     condition_order = np.array(dendrogram(condition_linkage, no_plot=True)['leaves'])
     
-    # Compute patient distances using first visit covariate matrix
-    patient_distances = pdist(X_cov_first_visit.numpy(), metric='euclidean')
-    patient_linkage = linkage(patient_distances, method='ward')
+    # Compute patient distances using first visit covariate matrix with Tanimoto distance
+    def tanimoto_distance(X):
+        """Compute Tanimoto distance matrix for binary data (vectorized)."""
+        X_binary = (X > 0).astype(float)
+        # Intersection: dot product
+        intersection = np.dot(X_binary, X_binary.T)
+        # Union: |A| + |B| - |A & B|
+        row_sums = X_binary.sum(axis=1)
+        union = row_sums[:, None] + row_sums[None, :] - intersection
+        # Avoid division by zero
+        with np.errstate(divide='ignore', invalid='ignore'):
+            tanimoto_sim = np.where(union == 0, 1.0, intersection / union)
+        tanimoto_dist = 1.0 - tanimoto_sim
+        # Return condensed distance matrix for pdist compatibility
+        return squareform(tanimoto_dist, checks=False)
+    
+    patient_distances = tanimoto_distance(X_cov_first_visit)
+    patient_linkage = linkage(patient_distances, method='average')
     patient_order = np.array(dendrogram(patient_linkage, no_plot=True)['leaves'])
     
     return patient_order, condition_order

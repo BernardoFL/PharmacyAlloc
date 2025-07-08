@@ -177,25 +177,10 @@ class Patient:
 
 
 
-def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_file="Data/drug_mapping_table.csv", drug_condition_file="Data/drug_condition_atc_table.csv"):
+def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_file="Data/drug_mapping_table.csv", drug_condition_file="Data/drug_condition_atc_table.csv", batch_size=None):
     """
     Constructs a list of Patient objects from three CSV files.
-    
-    Parameters:
-        main_file: CSV file with patient visit data. Columns include 'person_id', 'viscount', covariate columns,
-                   and medication columns (with drug names as headers and binary indicators as values).
-        conversion_file: CSV file mapping drug names (as in main_file) to rxcui codes.
-                         Expected: first column is drug name; last three columns contain up to three rxcui codes.
-        drug_condition_file: CSV file (drug_condition_atc_table.csv) with drug info.
-                             Expected columns: 'rxcui', 'standard', and for i=1,...,20:
-                              - 'Condition-i',
-                              - 'ATC-i-level-1', 'ATC-i-level-2', 'ATC-i-level-3', 'ATC-i-level-4'
-    
-    Returns:
-        A list of Patient objects. For each patient, the visits are constructed from the CSV.
-        Each visit contains a list of Drug objects.
-        Each Drug object is created by reading its ATC classifications and conditions from the drug_condition_file.
-        Additionally, each patient’s conditions attribute is a list of Condition objects constructed from the drugs taken.
+    If batch_size is specified, only the first batch_size patients are loaded.
     """
     # Read CSV files.
     df_main = pd.read_csv(main_file)
@@ -226,7 +211,10 @@ def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_fil
     patients = []
     
     # Group rows by person_id.
-    for person_id, df_patient in df_main.groupby('person_id'):
+    grouped = list(df_main.groupby('person_id'))
+    if batch_size is not None:
+        grouped = grouped[:batch_size]
+    for person_id, df_patient in grouped:
         visits = []
         # We'll collect conditions for this patient in a dictionary mapping condition name to Condition object.
         patient_conditions_dict = {}
@@ -369,58 +357,111 @@ def construct_A_matrix(patients: List[Patient]) -> Tuple[jnp.ndarray, Dict[str, 
 
 def construct_covariate_matrix(patients: List[Patient]) -> jnp.ndarray:
     """
-    Constructs a JAX matrix X of shape (N, d_total) from a list of patients,
-    where N is the number of patients and d_total is the sum of:
-      - the number of patient-level covariates (continuous) and
-      - the number of unique drugs (binary indicators indicating if the patient ever took that drug).
-      
-    The original patient covariates are taken from the 'covariates' attribute.
-    The drug indicators are computed by examining each patient's visits and drugs.
-    
+    Constructs a JAX matrix X of shape (n_patients, n_covs, max_n_visits)
+    from a list of patients with potentially variable numbers of visits.
+
+    The second dimension (n_covs) contains the concatenation of:
+      - Static patient-level continuous covariates.
+      - Visit-specific binary drug indicators.
+
+    For patients with fewer than max_n_visits, the remaining visit slots
+    are padded with static covariates and zero drug indicators.
+
     Parameters:
-        patients (list): A list of Patient objects.
-        
+        patients (List[Patient]): A list of Patient objects.
+
     Returns:
-        jnp.ndarray: A JAX array X with shape (N, d_total) where each row contains the concatenated
-                      patient-level covariates and drug indicator vector.
+        jnp.ndarray: A JAX array X with shape (n_patients, n_covs, max_n_visits).
+                      n_covs = num_static_covariates + num_unique_drugs.
     """
+    if not patients:
+        return jnp.empty((0, 0, 0))
 
-    # Extract the patient-level covariate array from each patient.
-    # Each patient.covariates is assumed to be a 1D array (or can be flattened to one).
-    cov_list = [patient.covariates.flatten() for patient in patients]
+    # --- 1. Extract Static Covariates and Find Max Visits ---
+    static_cov_list = []
+    max_n_visits = 0
+    for i, patient in enumerate(patients):
+        if not hasattr(patient, 'covariates') or not hasattr(patient, 'visits'):
+             raise AttributeError(f"Patient object at index {i} missing 'covariates' or 'visits' attribute.")
 
-    # Compute a list of all unique drugs (by rxcui) across all patients.
-    # We assume each Drug object has a unique rxcui (a string).
+        cov = np.array(patient.covariates, dtype=np.float32).flatten()
+        static_cov_list.append(cov)
+        max_n_visits = max(max_n_visits, len(patient.visits))
+
+    # Handle case where no patients have any visits
+    # if max_n_visits == 0:
+    #     logging.warning("No visits found across all patients. Resulting matrix will have 0 visit dimension.")
+        # Or raise ValueError("No visits found in any patient.") depending on desired behavior
+
+    num_static_covs = len(static_cov_list[0]) if static_cov_list else 0
+
+    # --- 2. Get Unique Drugs Across All Visits ---
     unique_drugs = {}
     for patient in patients:
         for visit in patient.visits:
+            if "drugs" not in visit: continue
             for drug in visit["drugs"]:
-                unique_drugs[drug.rxcui] = True
+                 if not hasattr(drug, 'rxcui'):
+                      raise AttributeError(f"Drug object {drug} in patient {getattr(patient, 'id', i)}, visit {visit.get('visit_id', 'N/A')} missing 'rxcui' attribute.")
+                 unique_drugs[str(drug.rxcui)] = True
+
     unique_drug_list = sorted(unique_drugs.keys())
-    num_drugs = len(unique_drug_list)
-    
-    # Build a mapping from drug rxcui to a column index.
+    num_unique_drugs = len(unique_drug_list)
     drug_to_index = {rxcui: idx for idx, rxcui in enumerate(unique_drug_list)}
-    
-    # For each patient, create a binary indicator vector of length num_drugs.
-    drug_indicators = []
-    for patient in patients:
-        indicator = jnp.zeros(num_drugs)
-        for visit in patient.visits:
-            for drug in visit["drugs"]:
-                # Mark 1 if the patient has taken this drug at least once.
-                idx = drug_to_index[drug.rxcui]
-                indicator = indicator.at[idx].set(1)
-        drug_indicators.append(indicator)
-    
-    # Concatenate each patient's original covariates with their drug indicator vector.
-    augmented_features = []
-    for cov, indicator in zip(cov_list, drug_indicators):
-        augmented = jnp.concatenate([cov, indicator])
-        augmented_features.append(augmented)
-    
-    # Stack into a matrix: shape (N, d_total)
-    return jnp.stack(augmented_features, axis=0)
+
+    n_patients = len(patients)
+    n_total_covs = num_static_covs + num_unique_drugs
+
+    # --- 3. Build the 3D Matrix with Padding ---
+    all_patient_data = [] # List to hold the data for each patient (each element will be shape (n_total_covs, max_n_visits))
+
+    # Pre-calculate the zero drug vector for padding efficiency
+    zero_drug_indicator = np.zeros(num_unique_drugs, dtype=np.float32)
+
+    for i, patient in enumerate(patients):
+        static_covs = static_cov_list[i] # Shape (num_static_covs,)
+        current_n_visits = len(patient.visits)
+
+        # Pre-calculate the feature vector used for padding this patient
+        padding_visit_features = np.concatenate([static_covs, zero_drug_indicator])
+
+        patient_visit_data = [] # List to hold combined features for each visit slot (actual + padded)
+
+        # Process actual visits
+        for visit_idx, visit in enumerate(patient.visits):
+            # Create drug indicator vector for THIS visit
+            visit_drug_indicator = np.zeros(num_unique_drugs, dtype=np.float32)
+            if "drugs" in visit:
+                for drug in visit["drugs"]:
+                    rxcui_str = str(drug.rxcui)
+                    if rxcui_str in drug_to_index:
+                        idx = drug_to_index[rxcui_str]
+                        visit_drug_indicator[idx] = 1.0
+
+            # Concatenate static covariates with the current visit's drug indicator
+            combined_visit_features = np.concatenate([static_covs, visit_drug_indicator])
+            patient_visit_data.append(combined_visit_features)
+
+        # Add padding if necessary
+        num_padding = max_n_visits - current_n_visits
+        for _ in range(num_padding):
+            patient_visit_data.append(padding_visit_features)
+
+        # Stack the visit data for this patient: list of vectors -> 2D array
+        # Resulting shape: (max_n_visits, n_total_covs)
+        patient_matrix_visits_first = np.stack(patient_visit_data, axis=0)
+
+        # Transpose to get the desired shape: (n_total_covs, max_n_visits)
+        patient_matrix = patient_matrix_visits_first.T
+        all_patient_data.append(patient_matrix)
+
+    # --- 4. Stack patient matrices into the final 3D array ---
+    # Input: list of (n_total_covs, max_n_visits) arrays
+    # Output: shape (n_patients, n_total_covs, max_n_visits)
+    final_matrix = np.stack(all_patient_data, axis=0)
+
+    # Convert the final NumPy array to a JAX array
+    return jnp.asarray(final_matrix)
 
 def get_all_drugs(list_of_patients):
     """
@@ -473,16 +514,18 @@ def get_all_conditions_from_drugs(patients):
 # Example usage:
 # conditions = get_all_conditions_from_drugs(patients)
 # print("Conditions from drugs:", conditions)
-def load_data():
+def load_data(batch_size=None):
     """
     Load and preprocess data, returning JAX arrays.
     Uses cached data if available.
+    If batch_size is specified, only the first batch_size patients are loaded.
     """
     # Check for cached data
     cache_file = 'Data/cached/preprocessed_data.npz'
     condition_cache = 'Data/cached/condition_list.pkl'
     
-    if os.path.exists(cache_file) and os.path.exists(condition_cache):
+    # Only use cache if batch_size is None
+    if batch_size is None and os.path.exists(cache_file) and os.path.exists(condition_cache):
         # Load from cache
         cached_data = np.load(cache_file)
         A = jnp.array(cached_data['A'])
@@ -492,10 +535,12 @@ def load_data():
             import pickle
             condition_list = pickle.load(f)
         
+        # Convert A from {0,1} to {-1,1} data
+        A = 2 * A - 1
         return A, X_cov, condition_list
     
-    # If no cache, load and process as before
-    patients = load_patients_from_csv_files()
+    # If no cache or batch_size is specified, load and process as before
+    patients = load_patients_from_csv_files(batch_size=batch_size)
     #remove patients with no drugs
     for patient in patients:
         for visit in patient.visits:
@@ -507,11 +552,12 @@ def load_data():
     X_cov = construct_covariate_matrix(patients)
     condition_list = get_all_conditions_from_drugs(patients)
     
-    # Save to cache
-    np.savez(cache_file, A=A, X_cov=X_cov)
-    with open(condition_cache, 'wb') as f:
-        import pickle
-        pickle.dump(condition_list, f)
+    # Only save cache if batch_size is None
+    if batch_size is None:
+        np.savez(cache_file, A=A, X_cov=X_cov)
+        with open(condition_cache, 'wb') as f:
+            import pickle
+            pickle.dump(condition_list, f)
     
     return A, X_cov, condition_list
 

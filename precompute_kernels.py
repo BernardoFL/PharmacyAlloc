@@ -28,6 +28,10 @@ import time
 from itertools import combinations_with_replacement
 from string_kernel import compute_similarity_multisentence, sample_random_kmers
 import jax.random as random
+from string_kernel import extract_kmers
+
+# Add this line at the top of your file with other global variables/imports
+alphabet = None
 
 def setup_logging(log_dir='logs'):
     """Set up logging configuration"""
@@ -137,38 +141,155 @@ def convert_condition_to_array(condition, char2int):
                 drug_arrays.append(jnp.array([char2int[str(level)] for level in atc]))
     return drug_arrays
 
-def compute_condition_similarity(cond1, cond2, random_kmers, char2int):
-    """Compute similarity between two conditions using string kernel"""
-    if not (cond1.drugs and cond2.drugs):
+# Fix the function signature in compute_condition_similarity()
+def compute_condition_similarity(arrays1, arrays2, custom_alphabet=None, m=100, threshold=0.05, batch_size=1000):
+    """Faster k-mer comparison using hash sets with relaxed matching and ATC hierarchy"""
+    # Access the global alphabet
+    global alphabet
+    
+    # Use custom alphabet if provided
+    alphabet_to_use = custom_alphabet if custom_alphabet is not None else alphabet
+    
+    k = 3  # k-mer length
+    
+    # Extract all k-mers from both conditions
+    kmers1 = []
+    kmers2 = []
+    
+    for arr in arrays1:
+        if arr.shape[0] >= k:
+            kmers1.append(extract_kmers(arr, k))
+    
+    for arr in arrays2:
+        if arr.shape[0] >= k:
+            kmers2.append(extract_kmers(arr, k))
+    
+    # If either condition has no valid k-mers, similarity is 0
+    if not kmers1 or not kmers2:
         return 0.0
     
-    # Convert conditions to integer arrays
-    arrays1 = convert_condition_to_array(cond1, char2int)
-    arrays2 = convert_condition_to_array(cond2, char2int)
+    # Concatenate all k-mers
+    kmers1 = jnp.concatenate(kmers1, axis=0)
+    kmers2 = jnp.concatenate(kmers2, axis=0)
     
-    if not (arrays1 and arrays2):
-        return 0.0
+    # Convert kmers2 to a hash set for O(1) lookups
+    # Convert JAX arrays to tuples for hashing
+    kmers2_set = {tuple(kmer.tolist()) for kmer in np.array(kmers2)}
     
-    return compute_similarity_multisentence(arrays1, arrays2, random_kmers)
+    # If either condition has fewer than m k-mers, use all of them
+    m1 = min(m, kmers1.shape[0])
+    
+    # Sample k-mers from condition 1
+    key = jax.random.PRNGKey(0)
+    indices1 = jax.random.choice(key, kmers1.shape[0], shape=(m1,), replace=False)
+    sampled_kmers1 = kmers1[indices1]
+    
+    # For large k-mer sets, process in batches
+    matches = 0
+    partial_matches = 0
+    
+    # Convert to NumPy arrays for easier list comprehension
+    np_sampled_kmers1 = np.array(sampled_kmers1)
+    np_kmers2_list = [tuple(kmer) for kmer in np.array(kmers2)]
+    
+    for i in range(m1):
+        kmer = tuple(np_sampled_kmers1[i])
+        
+        # Check for exact match
+        if kmer in kmers2_set:
+            matches += 1
+            continue
+            
+        # Check for partial matches (2 out of 3 positions matching)
+        for kmer2 in np_kmers2_list:
+            if sum(a == b for a, b in zip(kmer, kmer2)) >= k-1:
+                partial_matches += 1
+                break
+    
+    # Calculate similarity with both exact and partial matches
+    # Exact matches count as 1, partial as 0.5
+    sim1to2 = (matches + 0.5 * partial_matches) / m1 if m1 > 0 else 0
+    
+    # If similarity is still 0, use ATC hierarchy knowledge
+    if sim1to2 == 0:
+        # Extract first characters/levels of k-mers for hierarchical matching
+        first_chars1 = {kmer[0] for kmer in np_sampled_kmers1}
+        first_chars2 = {kmer[0] for kmer in np.array(kmers2)}
+        
+        # Check for hierarchical overlap
+        hierarchy_overlap = len(first_chars1.intersection(first_chars2))
+        if hierarchy_overlap > 0:
+            # Small non-zero similarity based on first level match
+            return 0.1 * (hierarchy_overlap / len(first_chars1))
+        
+        # Try reversed direction
+        kmers1_set = {tuple(kmer.tolist()) for kmer in np.array(kmers1)}
+        
+        m2 = min(m, kmers2.shape[0])
+        # Sample k-mers from condition 2
+        key = jax.random.PRNGKey(1)
+        indices2 = jax.random.choice(key, kmers2.shape[0], shape=(m2,), replace=False)
+        sampled_kmers2 = kmers2[indices2]
+        
+        matches = 0
+        partial_matches = 0
+        np_sampled_kmers2 = np.array(sampled_kmers2)
+        np_kmers1_list = [tuple(kmer) for kmer in np.array(kmers1)]
+        
+        for i in range(m2):
+            kmer = tuple(np_sampled_kmers2[i])
+            
+            # Check for exact match
+            if kmer in kmers1_set:
+                matches += 1
+                continue
+                
+            # Check for partial matches (2 out of 3 positions matching)
+            for kmer1 in np_kmers1_list:
+                if sum(a == b for a, b in zip(kmer, kmer1)) >= k-1:
+                    partial_matches += 1
+                    break
+        
+        sim2to1 = (matches + 0.5 * partial_matches) / m2 if m2 > 0 else 0
+        return sim2to1
+    
+    return sim1to2
+
+def get_alphabet(condition_list):
+    """Get alphabet from condition list"""
+    atc_chars = set()
+    for condition in condition_list:
+        for drug in condition.drugs:
+            for atc in drug.atcs:
+                if atc is not None:
+                    for level in atc:
+                        atc_chars.add(str(level))
+    return sorted(list(atc_chars))
 
 def process_condition_chunk(args):
     """Process a chunk of condition pairs with progress bar"""
-    start_idx, end_idx, condition_list, random_kmers, char2int = args
-    chunk_size = end_idx - start_idx
-    chunk_matrix = np.zeros((chunk_size, len(condition_list)))
-    
-    # Create progress bar for this chunk
-    pbar_desc = f"Chunk {start_idx}-{end_idx}"
-    for i, idx1 in enumerate(tqdm(range(start_idx, end_idx), 
-                                desc=pbar_desc, 
-                                leave=False)):
-        cond1 = condition_list[idx1]
-        for idx2 in range(len(condition_list)):
-            cond2 = condition_list[idx2]
-            sim = compute_condition_similarity(cond1, cond2, random_kmers, char2int)
-            chunk_matrix[i, idx2] = sim
-            
-    return chunk_matrix
+    try:
+        start_idx, end_idx, condition_list, char2int = args
+        chunk_size = end_idx - start_idx
+        chunk_matrix = np.zeros((chunk_size, len(condition_list)))
+        
+        # Create progress bar for this chunk
+        pbar_desc = f"Chunk {start_idx}-{end_idx}"
+        for i, idx1 in enumerate(tqdm(range(start_idx, end_idx), 
+                                    desc=pbar_desc, 
+                                    leave=False)):
+            cond1 = condition_list[idx1]
+            arrays1 = convert_condition_to_array(cond1, char2int)
+            for idx2 in range(len(condition_list)):
+                cond2 = condition_list[idx2]
+                arrays2 = convert_condition_to_array(cond2, char2int)
+                sim = compute_condition_similarity(arrays1, arrays2)
+                chunk_matrix[i, idx2] = sim
+                
+        return chunk_matrix
+    except Exception as e:
+        import traceback
+        return f"Error in process_condition_chunk: {str(e)}\n{traceback.format_exc()}"
 
 def setup_argument_parser():
     """Set up command line argument parsing"""
@@ -202,41 +323,25 @@ def main():
         logging.info(f"Loaded {n_conditions} conditions")
         
         # Create character to integer mapping
-        atc_chars = set()
-        for condition in condition_list:
-            for drug in condition.drugs:
-                for atc in drug.atcs:
-                    if atc is not None:
-                        for level in atc:
-                            atc_chars.add(str(level))
-        
-        alphabet = sorted(list(atc_chars))
+        global alphabet  # Tell Python you're modifying the global variable
+        alphabet = get_alphabet(condition_list)
         char2int = {c: i for i, c in enumerate(alphabet)}
         
-        # Compute chunk size based on number of cores
-        n_cores = min(args.num_cores, cpu_count())
-        chunk_size = max(1, n_conditions // n_cores)
-        chunks = [(i, min(i + chunk_size, n_conditions), condition_list, random_kmers, char2int) 
-                 for i in range(0, n_conditions, chunk_size)]
+        # Process without multiprocessing
+        logging.info("Processing without multiprocessing (single thread)")
+        kernel_matrix = np.zeros((n_conditions, n_conditions))
         
-        logging.info(f"Processing on {n_cores} cores with chunk size {chunk_size}")
+        # Use tqdm for progress tracking
+        for idx1 in tqdm(range(n_conditions), desc="Computing similarities"):
+            cond1 = condition_list[idx1]
+            arrays1 = convert_condition_to_array(cond1, char2int)
+            for idx2 in range(n_conditions):
+                cond2 = condition_list[idx2]
+                arrays2 = convert_condition_to_array(cond2, char2int)
+                sim = compute_condition_similarity(arrays1, arrays2, alphabet)
+                kernel_matrix[idx1, idx2] = sim
         
-        # Process chunks in parallel with overall progress bar
-        total_pairs = n_conditions * n_conditions
-        with ProcessPoolExecutor(max_workers=n_cores) as executor:
-            futures = list(executor.submit(process_condition_chunk, chunk) 
-                         for chunk in chunks)
-            
-            results = []
-            for future in tqdm(futures, 
-                             desc="Processing chunks", 
-                             total=len(futures)):
-                results.append(future.result())
-        
-        # Combine results
-        kernel_matrix = np.vstack(results)
-        
-        # Make symmetric
+        # Make symmetric (just to be safe)
         kernel_matrix = np.maximum(kernel_matrix, kernel_matrix.T)
         
         # Save the precomputed kernel
