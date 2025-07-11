@@ -169,47 +169,105 @@ class IsingAnisotropic():
         Compute weighted interactions using:
         - param[0] (gamma) for horizontal direction
         - param[1:C+1] (beta_c) for vertical directions
+        
+        Optimized version to reduce memory usage and computation time.
         """
         gamma = param[0]  # horizontal parameter
         beta_c = param[1:]  # vertical parameters
         
-        # Horizontal interactions (single parameter gamma)
-        h_interactions = X @ self.H_mat * gamma
+        # Reshape X to (batch_size, n, C) for more efficient computation
+        batch_size = X.shape[0]
+        X_reshaped = X.view(batch_size, self.n, self.C)
         
-        # Vertical interactions (C parameters beta_c)
-        v_interactions = torch.zeros_like(X)
+        # Horizontal interactions (within each row)
+        h_interactions = torch.zeros_like(X_reshaped)
+        for i in range(self.n):
+            for c in range(self.C):
+                # Left neighbor
+                if c > 0:
+                    h_interactions[:, i, c] += X_reshaped[:, i, c-1] * gamma
+                # Right neighbor
+                if c < self.C - 1:
+                    h_interactions[:, i, c] += X_reshaped[:, i, c+1] * gamma
+        
+        # Vertical interactions (within each column)
+        v_interactions = torch.zeros_like(X_reshaped)
         for c in range(self.C):
-            v_interactions += (X @ self.V_mats[c]) * beta_c[c]
+            for i in range(self.n):
+                # Up neighbor
+                if i > 0:
+                    v_interactions[:, i, c] += X_reshaped[:, i-1, c] * beta_c[c]
+                # Down neighbor
+                if i < self.n - 1:
+                    v_interactions[:, i, c] += X_reshaped[:, i+1, c] * beta_c[c]
         
-        return h_interactions + v_interactions
+        # Reshape back to original shape
+        total_interactions = h_interactions + v_interactions
+        return total_interactions.view(batch_size, -1)
     
     
     def stat_m(self, X):
-        # Separate horizontal and vertical interactions
-        h_interactions = X @ self.H_mat
-        v_interactions = torch.zeros_like(X)
-        for c in range(self.C):
-            v_interactions += X @ self.V_mats[c]
-            
-        # Return separate statistics for each dimension
-        h_stat = -2 * X * h_interactions  # horizontal statistics
-        v_stat = -2 * X * v_interactions  # vertical statistics
+        # Optimized version using direct neighbor computation
+        batch_size = X.shape[0]
+        X_reshaped = X.view(batch_size, self.n, self.C)
         
-        return torch.stack([h_stat, v_stat], dim=1)  # shape: (n_samples, 2)
+        # Horizontal statistics
+        h_stat = torch.zeros_like(X_reshaped)
+        for i in range(self.n):
+            for c in range(self.C):
+                if c > 0:
+                    h_stat[:, i, c] += X_reshaped[:, i, c-1]
+                if c < self.C - 1:
+                    h_stat[:, i, c] += X_reshaped[:, i, c+1]
+        h_stat = -2 * X_reshaped * h_stat
+        
+        # Vertical statistics
+        v_stat = torch.zeros_like(X_reshaped)
+        for c in range(self.C):
+            for i in range(self.n):
+                if i > 0:
+                    v_stat[:, i, c] += X_reshaped[:, i-1, c]
+                if i < self.n - 1:
+                    v_stat[:, i, c] += X_reshaped[:, i+1, c]
+        v_stat = -2 * X_reshaped * v_stat
+        
+        # Sum across all positions
+        h_sum = torch.sum(h_stat.view(batch_size, -1), dim=1)
+        v_sum = torch.sum(v_stat.view(batch_size, -1), dim=1)
+        
+        return torch.stack([h_sum, v_sum], dim=1)  # shape: (n_samples, 2)
         
         
     def stat_p(self, X):
-        # Separate horizontal and vertical interactions
-        h_interactions = X @ self.H_mat
-        v_interactions = torch.zeros_like(X)
-        for c in range(self.C):
-            v_interactions += X @ self.V_mats[c]
-            
-        # Return separate statistics for each dimension
-        h_stat = 2 * X * h_interactions  # horizontal statistics
-        v_stat = 2 * X * v_interactions  # vertical statistics
+        # Optimized version using direct neighbor computation
+        batch_size = X.shape[0]
+        X_reshaped = X.view(batch_size, self.n, self.C)
         
-        return torch.stack([h_stat, v_stat], dim=1)  # shape: (n_samples, 2)
+        # Horizontal statistics
+        h_stat = torch.zeros_like(X_reshaped)
+        for i in range(self.n):
+            for c in range(self.C):
+                if c > 0:
+                    h_stat[:, i, c] += X_reshaped[:, i, c-1]
+                if c < self.C - 1:
+                    h_stat[:, i, c] += X_reshaped[:, i, c+1]
+        h_stat = 2 * X_reshaped * h_stat
+        
+        # Vertical statistics
+        v_stat = torch.zeros_like(X_reshaped)
+        for c in range(self.C):
+            for i in range(self.n):
+                if i > 0:
+                    v_stat[:, i, c] += X_reshaped[:, i-1, c]
+                if i < self.n - 1:
+                    v_stat[:, i, c] += X_reshaped[:, i+1, c]
+        v_stat = 2 * X_reshaped * v_stat
+        
+        # Sum across all positions
+        h_sum = torch.sum(h_stat.view(batch_size, -1), dim=1)
+        v_sum = torch.sum(v_stat.view(batch_size, -1), dim=1)
+        
+        return torch.stack([h_sum, v_sum], dim=1)  # shape: (n_samples, 2)
         
         
     def ratio_m(self, param, SX_m):
