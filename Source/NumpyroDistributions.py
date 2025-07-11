@@ -7,8 +7,8 @@ import numpyro.distributions as dist
 import jax
 import jax.numpy as jnp
 from jax import random
-import torch
 import numpy as np
+import torch
 
 # Import the required modules
 import sys
@@ -22,30 +22,29 @@ from Posteriors import FDBayes
 
 class IsingAnisotropicDistribution(dist.Distribution):
     """
-    A Numpyro distribution that samples probability matrices based on 
-    the IsingAnisotropic model with FDBayes posterior.
+    A Numpyro distribution that samples binary matrices from the IsingAnisotropic model.
     
-    This distribution generates probability matrices where each column 
-    represents a multinomial distribution, with the probability structure
-    determined by the Gibbs measure from the IsingAnisotropic model.
-
-    Now supports hyperpriors on gamma and beta parameters.
+    This distribution generates binary matrices X ∈ {-1, 1}^{n×C} where the joint
+    probability is defined by the Ising model energy function and represented
+    through the FDBayes generalized likelihood.
+    
+    The model uses:
+    - γ (gamma) for horizontal interactions within rows
+    - β_c (beta_c) for vertical interactions within column c
     """
     
-    def __init__(self, n, C, prior_params=None, hyperpriors=None, validate_args=None):
+    def __init__(self, n, C, prior_params=None, validate_args=None):
         """
         Initialize the IsingAnisotropic distribution.
         
         Parameters:
         -----------
         n : int
-            Number of features per column (categories)
+            Number of rows in the binary matrix
         C : int
-            Number of columns (multinomial variables)
+            Number of columns in the binary matrix
         prior_params : dict, optional
             Parameters for the prior distribution on Ising parameters
-        hyperpriors : dict, optional
-            Dictionary with keys 'gamma' and 'beta' specifying Numpyro distributions or their parameters for hyperpriors.
         validate_args : bool, optional
             Whether to validate arguments
         """
@@ -57,18 +56,21 @@ class IsingAnisotropicDistribution(dist.Distribution):
             'beta_mean': 0.0,
             'beta_std': 1.0
         }
-        self.hyperpriors = hyperpriors
+        
+        # Initialize the Ising model
         self.ising_model = IsingAnisotropic(n, C)
+        
+        # Event shape is the binary matrix shape
         event_shape = (n, C)
         super().__init__(event_shape=event_shape, validate_args=validate_args)
         
         # Add required attributes for Numpyro compatibility
-        self._is_discrete = False
-        self._support = dist.constraints.real
+        self._is_discrete = True  # Binary matrices are discrete
+        self._support = dist.constraints.integer_interval(-1, 1)
 
     def sample(self, key, sample_shape=()):
         """
-        Sample probability matrices from the distribution.
+        Sample binary matrices from the Ising model.
         
         Parameters:
         -----------
@@ -80,25 +82,47 @@ class IsingAnisotropicDistribution(dist.Distribution):
         Returns:
         --------
         samples : jax.numpy.ndarray
-            Sampled probability matrices of shape sample_shape + (n, C)
+            Sampled binary matrices of shape sample_shape + (n, C) with values in {-1, 1}
         """
+        # Sample Ising parameters first
         ising_params = self._sample_ising_params(key, sample_shape)
-        samples = np.stack([self._params_to_probabilities(np.array(p)) for p in np.array(ising_params)])
-        return samples
+        
+        # Convert to torch for the Ising model
+        if len(sample_shape) > 0:
+            # Handle multiple samples
+            samples = []
+            for i in range(sample_shape[0]):
+                param_torch = torch.tensor(np.array(ising_params[i]), dtype=torch.float32)
+                # Sample one binary matrix using the Ising model
+                sample_torch = self.ising_model.sample(param_torch, num_sample=1)
+                # Reshape to (n, C) and convert to JAX
+                sample_reshaped = sample_torch.view(self.n, self.C)
+                samples.append(jnp.array(sample_reshaped.numpy()))
+            return jnp.stack(samples)
+        else:
+            # Single sample
+            param_torch = torch.tensor(np.array(ising_params), dtype=torch.float32)
+            sample_torch = self.ising_model.sample(param_torch, num_sample=1)
+            sample_reshaped = sample_torch.view(self.n, self.C)
+            return jnp.array(sample_reshaped.numpy())
 
     def _sample_ising_params(self, key, sample_shape):
+        """
+        Sample Ising parameters (gamma, beta_1, ..., beta_C) from priors.
+        """
         gamma_key, beta_key = random.split(key)
-        # Sample from fixed prior parameters
+        
+        # Sample gamma (horizontal interaction parameter)
         gamma = dist.Normal(
             loc=self.prior_params['gamma_mean'],
             scale=self.prior_params['gamma_std']
         ).sample(gamma_key, sample_shape)
         
-        # Handle beta sampling - beta_std might be a vector or scalar
+        # Sample beta parameters (vertical interaction parameters)
         beta_mean = self.prior_params['beta_mean']
         beta_std = self.prior_params['beta_std']
         
-        # If beta_std is a vector, we need to sample each beta with its own std
+        # Handle beta sampling - beta_std might be a vector or scalar
         if hasattr(beta_std, 'shape') and len(beta_std.shape) > 0:
             # beta_std is a vector, sample each beta with its own std
             beta_samples = []
@@ -118,68 +142,61 @@ class IsingAnisotropicDistribution(dist.Distribution):
         
         # Ensure gamma has the right shape for concatenation
         if len(sample_shape) > 0:
-            # If we have sample dimensions, expand gamma to match beta's shape
-            gamma_expanded = gamma[..., None]  # Add dimension to match beta
+            gamma_expanded = gamma[..., None]
         else:
-            # No sample dimensions, just add a dimension to gamma
             gamma_expanded = gamma[None] if gamma.ndim == 0 else gamma[..., None]
         
+        # Concatenate gamma and beta parameters
         params = jnp.concatenate([gamma_expanded, beta], axis=-1)
-        params = jnp.exp(params)
         return params
-
-    def _params_to_probabilities(self, params):
-        params_torch = torch.tensor(np.array(params), dtype=torch.float32)
-        probs = torch.zeros(self.n, self.C)
-        for c in range(self.C):
-            X_configs = torch.zeros(self.n, self.n, self.C)
-            for i in range(self.n):
-                X_configs[i, i, c] = 1.0
-            X_flat = X_configs.view(self.n, -1)
-            interactions = self.ising_model._compute_interactions(X_flat, params_torch)
-            log_probs = interactions.sum(dim=1)
-            probs[:, c] = torch.softmax(log_probs, dim=0)
-        return jnp.array(probs.numpy())
 
     def log_prob(self, value):
         """
-        Compute the log probability for the given probability matrix.
+        Compute the log probability for the given binary matrix using FDBayes.
         
-        For Numpyro compatibility, this computes a simple log probability
-        based on the prior parameters. The FDBayes-specific log_prob
-        with explicit parameters is available as log_prob_fdbayes().
+        This computes the FDBayes generalized likelihood for the observed binary matrix.
         
         Parameters:
         -----------
         value : jax.numpy.ndarray
-            Probability matrix of shape (n, C)
+            Binary matrix of shape (n, C) with values in {-1, 1}
         
         Returns:
         --------
         log_prob : float
-            Log probability based on prior parameters
+            Log probability based on FDBayes generalized likelihood
         """
-        # For Numpyro compatibility, compute a simple log probability
-        # based on the prior parameters
-        if self.prior_params is None:
-            return 0.0
+        # Convert to torch for the Ising model
+        value_torch = torch.tensor(np.array(value), dtype=torch.float32)
         
-        # Convert to jax array for computation
-        value_jnp = jnp.asarray(value)
+        # Reshape to (1, n*C) for the Ising model which expects batch dimension
+        # value_torch shape: (n, C) -> reshape to (1, n*C)
+        value_reshaped = value_torch.view(1, -1)  # Add batch dimension
         
-        # Simple log probability based on prior parameters
-        # This is a placeholder - in practice, you might want a more sophisticated prior
-        log_prob = 0.0
+        # Sample parameters from the prior for computing the likelihood
+        # In practice, you might want to pass the parameters explicitly
+        key = random.PRNGKey(0)  # Use fixed key for consistency
+        params = self._sample_ising_params(key, ())
+        param_torch = torch.tensor(np.array(params), dtype=torch.float32)
         
-        # Add regularization term to encourage reasonable probability values
-        log_prob -= 0.1 * jnp.sum(value_jnp ** 2)  # L2 regularization
+        # Set up FDBayes posterior
+        log_prior = lambda p: -0.5 * torch.sum(p**2)  # Simple Gaussian prior
+        posterior = FDBayes(
+            self.ising_model.ratio_m,
+            self.ising_model.ratio_p,
+            self.ising_model.stat_m,
+            self.ising_model.stat_p,
+            log_prior
+        )
         
-        # Add constraint that probabilities should be positive and sum to 1 per column
-        for c in range(self.C):
-            col_sum = jnp.sum(value_jnp[:, c])
-            log_prob -= jnp.where(col_sum > 0, 0.1 * jnp.abs(col_sum - 1.0), 0.0)  # Encourage column sums to be 1
+        # Set the data in the posterior
+        posterior.set_X(value_reshaped)
         
-        return log_prob
+        # Compute the FDBayes loss (negative log likelihood)
+        loss = posterior.loss(param_torch)
+        
+        # Return negative loss as log probability
+        return -loss
     
     @property
     def is_discrete(self):
@@ -194,68 +211,50 @@ class IsingAnisotropicDistribution(dist.Distribution):
     @property
     def mean(self):
         """Return the mean of the distribution."""
-        # Return a uniform probability matrix as the mean
-        return jnp.ones((self.n, self.C)) / self.n
+        # For binary matrices, return zeros (neutral mean)
+        return jnp.zeros((self.n, self.C))
     
-    def log_prob_fdbayes(self, value, param=None):
+    def enumerate_support(self, expand=True):
         """
-        Compute the log generalized likelihood (negative FDBayes loss) for the given data matrix and Ising parameters.
+        Enumerate support of the distribution.
+        
+        For binary matrices, this would be computationally expensive,
+        so we return a simple approximation.
+        """
+        # Return a simple approximation - just zeros matrix
+        # In practice, for large matrices this is not feasible to enumerate
+        support = jnp.zeros((1, self.n, self.C))
+        if expand:
+            return support
+        else:
+            return support[0]
+    
+    def log_prob_with_params(self, value, params):
+        """
+        Compute log probability with explicit parameters.
         
         Parameters:
         -----------
         value : jax.numpy.ndarray
-            Data matrix of shape (n, C) (should be integer or one-hot encoded)
-        param : array-like or torch.Tensor
-            Ising parameters (gamma, beta_1, ..., beta_C), shape (C+1,)
+            Binary matrix of shape (n, C) with values in {-1, 1}
+        params : jax.numpy.ndarray
+            Ising parameters [gamma, beta_1, ..., beta_C]
         
         Returns:
         --------
         log_prob : float
-            Log generalized likelihood (negative FDBayes loss)
+            Log probability based on FDBayes generalized likelihood
         """
-        if param is None:
-            raise ValueError("log_prob_fdbayes requires explicit Ising parameters (param) for FDBayes generalized likelihood.")
-        # Convert value and param to torch
+        # Convert to torch
         value_torch = torch.tensor(np.array(value), dtype=torch.float32)
-        param_torch = torch.tensor(np.array(param), dtype=torch.float32)
-        # Set up FDBayes
-        log_prior = lambda p: -0.5 * torch.sum(p**2)  # Simple Gaussian prior (not used in loss)
-        posterior = FDBayes(
-            self.ising_model.ratio_m,
-            self.ising_model.ratio_p,
-            self.ising_model.stat_m,
-            self.ising_model.stat_p,
-            log_prior
-        )
-        posterior.set_X(value_torch)
-        loss = posterior.loss(param_torch)
-        return -loss  # negative FDBayes loss is the generalized log-likelihood
-    
-    def sample_with_fdbayes(self, key, data, num_samples=1000, num_burnin=500):
-        """
-        Sample probability matrices using FDBayes posterior.
+        param_torch = torch.tensor(np.array(params), dtype=torch.float32)
         
-        Parameters:
-        -----------
-        key : jax.random.PRNGKey
-            Random key for sampling
-        data : jax.numpy.ndarray
-            Observed data of shape (n_samples, C) with integer indices
-        num_samples : int
-            Number of posterior samples
-        num_burnin : int
-            Number of burn-in samples
-            
-        Returns:
-        --------
-        samples : jax.numpy.ndarray
-            Sampled probability matrices of shape (num_samples, n, C)
-        """
-        # Convert data to torch tensor
-        data_torch = torch.tensor(np.array(data), dtype=torch.long)
+        # Reshape to (1, n*C) for the Ising model which expects batch dimension
+        # value_torch shape: (n, C) -> reshape to (1, n*C)
+        value_reshaped = value_torch.view(1, -1)  # Add batch dimension
         
         # Set up FDBayes posterior
-        log_prior = lambda param: -0.5 * torch.sum(param**2)  # Simple Gaussian prior
+        log_prior = lambda p: -0.5 * torch.sum(p**2)
         posterior = FDBayes(
             self.ising_model.ratio_m,
             self.ising_model.ratio_p,
@@ -264,137 +263,8 @@ class IsingAnisotropicDistribution(dist.Distribution):
             log_prior
         )
         
-        # Set data in posterior
-        posterior.set_X(data_torch)
+        # Set the data and compute loss
+        posterior.set_X(value_reshaped)
+        loss = posterior.loss(param_torch)
         
-        # Set up transition distribution
-        transit_p = torch.distributions.MultivariateNormal(
-            torch.zeros(self.C+1), 
-            0.1 * torch.eye(self.C+1)
-        )
-        
-        # Sample from posterior
-        post_samples = posterior.sample(
-            num_samples, 
-            num_burnin, 
-            transit_p, 
-            torch.randn(self.C+1), 
-            beta=1.0
-        )
-        
-        # Convert posterior samples to probability matrices
-        prob_samples = []
-        for i in range(min(num_samples, post_samples.shape[0])):
-            param = post_samples[i]
-            probs = self._params_to_probabilities(param)
-            prob_samples.append(probs)
-        
-        return jnp.array(prob_samples)
-
-
-def ising_anisotropic_model(n, C, data=None, prior_params=None):
-    """
-    Numpyro model using IsingAnisotropicDistribution.
-    
-    Parameters:
-    -----------
-    n : int
-        Number of features per column
-    C : int
-        Number of columns
-    data : jax.numpy.ndarray, optional
-        Observed data
-    prior_params : dict, optional
-        Prior parameters for the distribution
-    """
-    # Sample probability matrix from IsingAnisotropic distribution
-    probs = numpyro.sample(
-        "probs", 
-        IsingAnisotropicDistribution(n, C, prior_params)
-    )
-    
-    if data is not None:
-        # Sample observations from multinomial distributions
-        for i in range(data.shape[0]):
-            for c in range(C):
-                numpyro.sample(
-                    f"obs_{i}_{c}",
-                    dist.Categorical(probs=probs[:, c]),
-                    obs=data[i, c]
-                )
-
-
-def ising_anisotropic_guide(n, C, prior_params=None):
-    """
-    Guide (variational distribution) for the IsingAnisotropic model.
-    
-    Parameters:
-    -----------
-    n : int
-        Number of features per column
-    C : int
-        Number of columns
-    prior_params : dict, optional
-        Prior parameters
-    """
-    # Variational parameters for the probability matrix
-    probs_loc = numpyro.param("probs_loc", jnp.ones((n, C)) / n)
-    probs_scale = numpyro.param("probs_scale", jnp.ones((n, C)) * 0.1)
-    
-    # Sample from variational distribution
-    probs = numpyro.sample(
-        "probs",
-        dist.Normal(probs_loc, probs_scale)
-    )
-    
-    # Ensure probabilities are positive and sum to 1
-    probs = jax.nn.softmax(probs, axis=0)
-
-
-# Utility functions for working with the distribution
-
-def sample_ising_probabilities(n, C, key, num_samples=1, prior_params=None):
-    """
-    Convenience function to sample probability matrices.
-    
-    Parameters:
-    -----------
-    n : int
-        Number of features per column
-    C : int
-        Number of columns
-    key : jax.random.PRNGKey
-        Random key
-    num_samples : int
-        Number of samples
-    prior_params : dict, optional
-        Prior parameters
-        
-    Returns:
-    --------
-    samples : jax.numpy.ndarray
-        Sampled probability matrices
-    """
-    dist_obj = IsingAnisotropicDistribution(n, C, prior_params)
-    return dist_obj.sample(key, (num_samples,))
-
-
-def compute_ising_entropy(probs):
-    """
-    Compute entropy of probability matrices.
-    
-    Parameters:
-    -----------
-    probs : jax.numpy.ndarray
-        Probability matrices of shape (..., n, C)
-        
-    Returns:
-    --------
-    entropy : jax.numpy.ndarray
-        Entropy values
-    """
-    # Add small epsilon to avoid log(0)
-    eps = 1e-8
-    log_probs = jnp.log(probs + eps)
-    entropy = -jnp.sum(probs * log_probs, axis=-2)  # Sum over features
-    return entropy 
+        return -loss 
