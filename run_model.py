@@ -32,6 +32,7 @@ from numpyro.infer.util import initialize_model
 # Import the required modules
 from Source.NumpyroDistributions import IsingAnisotropicDistribution
 from dataloader import load_data
+from Source.JAXFDBayes import JAXFDBayes
 
 def setup_logging(log_dir='logs'):
     """
@@ -118,174 +119,126 @@ def prepare_ising_data(A_sorted, X_cov_sorted, condition_list):
     
     return data_array
 
-def ising_model(n, C, data):
+
+
+def gmrf_model(I, C, data=None):
     """
-    Numpyro model for IsingAnisotropic inference with hierarchical priors.
+    Numpyro model for Gaussian Markov Random Field (GMRF) inference.
     
-    This model implements a hierarchical Bayesian structure for the Ising model:
-    1. Samples hyperpriors for gamma parameters (Normal-Gamma)
-    2. Samples hyperpriors for beta parameters (Horseshoe prior)
-    3. Samples probability matrices from IsingAnisotropicDistribution
-    4. Models data as independent Bernoulli draws
+    The model implements:
+    1. Hyperpriors for sigma, gamma, and beta parameters
+    2. Latent grid x with GMRF prior
+    3. Probability grid p = sigmoid(x)
+    4. Likelihood for observed binary data
     
     Parameters
     ----------
-    n : int
-        Number of features per column (categories).
+    I : int
+        Number of rows (patients)
     C : int
-        Number of columns (multinomial variables).
-    data : jax.numpy.ndarray
-        Observed data matrix of shape (n_samples, n*C) where each row represents
-        a flattened observation.
-        
-    Notes
-    -----
-    The model uses the following hierarchical structure:
-    
-    - gamma_mean ~ Normal(0, 2)
-    - gamma_std ~ Gamma(2, 1)
-    - tau ~ HalfCauchy(1)  # Global shrinkage
-    - lambda_beta_c ~ HalfCauchy(1)  # Local shrinkage for each c
-    - beta_mean ~ Normal(0, 2)
-    - beta_std = tau * lambda_beta  # Horseshoe shrinkage
-    - probs ~ IsingAnisotropicDistribution(n, C, dynamic_prior_params)
-    - data[i, c] ~ Bernoulli(probs[c])
-    
-    Examples
-    --------
-    >>> n, C = 3, 4
-    >>> data = jnp.random.randint(0, 2, size=(10, n*C))
-    >>> model = lambda: ising_model(n, C, data)
+        Number of columns (conditions)
+    data : jax.numpy.ndarray, optional
+        Observed binary data of shape (I, C) with values in {0, 1}
     """
-    # Sample hyperpriors for gamma
-    gamma_mean = numpyro.sample("gamma_mean", dist.Normal(0, 2))
-    gamma_std = numpyro.sample("gamma_std", dist.Gamma(2, 1))  # Positive std
+    # Define hyperpriors
+    sigma = numpyro.sample("sigma", dist.HalfCauchy(1.0))
+    
+    # Normal-InverseGamma hyperprior for gamma
+    gamma_mean = numpyro.sample("gamma_mean", dist.Normal(0, 5))
+    gamma_std2 = numpyro.sample("gamma_std2", dist.InverseGamma(2, 2))
+    gamma_std = jnp.sqrt(gamma_std2)
+    gamma = numpyro.sample("gamma", dist.Normal(gamma_mean, gamma_std))
     
     # Horseshoe prior for betas
-    # Global shrinkage parameter
-    tau = numpyro.sample("tau", dist.HalfCauchy(1))
+    tau = numpyro.sample("tau", dist.HalfCauchy(1.0))
+    lambda_betas = numpyro.sample("lambda_betas", dist.HalfCauchy(jnp.ones(C-1)))
+    beta = numpyro.sample("beta", dist.Normal(0, tau * lambda_betas))
     
-    # Local shrinkage parameters for each beta
-    lambda_beta = numpyro.sample("lambda_beta", dist.HalfCauchy(1).expand([C]))
+    # Sample the latent grid x from independent Normal (potential term)
+    # This efficiently implements the potential term -x^2/(2*sigma^2)
+    x = numpyro.sample("x", dist.Normal(0, sigma).expand([I, C]))
     
-    # Beta means and standard deviations using horseshoe structure
-    beta_mean = numpyro.sample("beta_mean", dist.Normal(0, 2))
-    beta_std = tau * lambda_beta  # Horseshoe shrinkage
+    # Add GMRF interaction terms using numpyro.factor
     
-    # Create prior parameters using the sampled hyperpriors
-    dynamic_prior_params = {
-        'gamma_mean': gamma_mean,
-        'gamma_std': gamma_std,
-        'beta_mean': beta_mean,
-        'beta_std': beta_std
-    }
+    # Vertical interactions (between rows): gamma * sum(x[i,c] * x[i+1,c])
+    v_potential = gamma * jnp.sum(x[:-1, :] * x[1:, :])
+    numpyro.factor("v_interact", v_potential)
     
-    # Sample probability matrix from IsingAnisotropicDistribution
-    probs = numpyro.sample(
-        "probs", 
-        IsingAnisotropicDistribution(n, C, dynamic_prior_params)
-    )
-    # For each data point and each variable, sample from Bernoulli
-    for i in range(data.shape[0]):
-        for c in range(C):
-            numpyro.sample(
-                f"obs_{i}_{c}",
-                dist.Bernoulli(probs=probs[c]),  # or probs[:, c] depending on shape
-                obs=data[i, c]
-            )
+    # Horizontal interactions (between columns): sum(beta[c] * sum(x[i,c] * x[i,c+1]))
+    h_potential = jnp.sum(beta * jnp.sum(x[:, :-1] * x[:, 1:], axis=0))
+    numpyro.factor("h_interact", h_potential)
+    
+    # Transform to probabilities using sigmoid with clipping to prevent extreme values
+    p_raw = jax.nn.sigmoid(x)
+    p = jnp.clip(p_raw, 1e-7, 1.0 - 1e-7)
+    
+    # Add likelihood for observed data if provided
+    if data is not None:
+        # Use binomial likelihood for binary data
+        numpyro.sample("obs", dist.Binomial(total_count=1, probs=p), obs=data)
+    
+    return p
 
-def run_ising_inference(data, args):
+
+def run_gmrf_inference(data, args):
     """
-    Run IsingAnisotropic model inference using Numpyro MCMC.
+    Run Gaussian Markov Random Field (GMRF) model inference using Numpyro MCMC.
     
-    Performs Bayesian inference on the Ising model using NUTS (No-U-Turn Sampler)
-    with multiple chains. The model automatically determines grid dimensions
-    based on the number of conditions in the data.
+    Performs Bayesian inference on the GMRF model using NUTS (No-U-Turn Sampler)
+    with multiple chains. The model samples probability matrices and uses binomial likelihood.
     
-    Parameters
-    ----------
+    Parameters:
+    -----------
     data : jax.numpy.ndarray
-        Input data matrix of shape (n_patients, n_conditions).
+        Input binary data matrix of shape (n_patients, n_conditions) with values in {0, 1}
     args : argparse.Namespace
-        Command line arguments containing inference parameters:
-        - dnum: Number of data samples to use
-        - pnum: Number of posterior samples
+        Command line arguments containing inference parameters
         
-    Returns
+    Returns:
     -------
     tuple
-        A tuple containing:
-        - post_samples: jax.numpy.ndarray
-            Posterior samples of probability matrices, shape (n_samples, n, C)
-        - times_post: None
-            Placeholder for timing information (not implemented)
-        - beta_opt: None
-            Placeholder for optimal beta (not implemented)
-        - time_bootstrap: None
-            Placeholder for bootstrap timing (not implemented)
-            
-    Notes
-    -----
-    The function automatically:
-    1. Determines grid dimensions (n, C) based on data shape
-    2. Pads or truncates data to fit the grid
-    3. Runs MCMC with 4 chains using NUTS sampler
-    4. Saves results to timestamped directory in ./Res/
-    
-    Examples
-    --------
-    >>> data = jnp.random.randint(0, 2, size=(100, 50))
-    >>> args = argparse.Namespace(dnum=100, pnum=1000)
-    >>> samples, _, _, _ = run_ising_inference(data, args)
+        A tuple containing posterior samples and timing information
     """
-    logging.info("Starting IsingAnisotropic model inference with Numpyro...")
+    logging.info("Starting GMRF model inference with Numpyro...")
     
     # Set random seeds for reproducibility
     key = random.PRNGKey(0)
     
-    # Determine grid dimensions based on number of conditions
-    n_conditions = data.shape[1]
-    n = int(np.ceil(np.sqrt(n_conditions)))  # rows
-    C = int(np.ceil(n_conditions / n))       # columns
-    grid_size = n * C
-    logging.info(f"Using IsingAnisotropic grid size: n={n}, C={C} (for {n_conditions} conditions)")
+    # Ensure data is binary {0, 1}
+    binary_data = jnp.where(data > 0.5, 1, 0)
+    
+    # Determine grid dimensions
+    I, C = binary_data.shape  # I = patients (rows), C = conditions (columns)
+    
+    logging.info(f"Using GMRF grid size: I={I} (patients), C={C} (conditions)")
+    logging.info(f"Grid size: {I} × {C} = {I * C}")
     
     # Prepare data for the model
-    n_samples = min(args.dnum, data.shape[0])
-    inference_data = data[:n_samples]
+    inference_data = binary_data
     
-    # If we have more conditions than the grid can handle, use a subset
-    if n_conditions > grid_size:
-        logging.warning(f"Number of conditions ({n_conditions}) exceeds grid capacity ({grid_size}). Using first {grid_size} conditions.")
-        inference_data = inference_data[:, :grid_size]
-    
-    # Pad the data if we have fewer conditions than grid capacity
-    if inference_data.shape[1] < grid_size:
-        padding_size = grid_size - inference_data.shape[1]
-        padding = jnp.zeros((inference_data.shape[0], padding_size))
-        inference_data = jnp.concatenate([inference_data, padding], axis=1)
-    
-    logging.info(f"Final inference data shape: {inference_data.shape}")
-    
+    logging.info(f"Data shape: {inference_data.shape}")
+    logging.info(f"Binary values: {jnp.unique(inference_data)}")
+    logging.info(f"Data statistics: mean={inference_data.mean():.4f}, std={inference_data.std():.4f}")
+
     # Create Numpyro model
-    model = lambda: ising_model(n, C, inference_data)
+    model = lambda: gmrf_model(I, C, inference_data)
     
-    # Initialize model
-    logging.info("Initializing model...")
-    from numpyro.infer.util import initialize_model
-    init_params = initialize_model(key, model)
-    
-    # Set up NUTS sampler
+    # Set up NUTS sampler with memory-efficient settings
     from numpyro.infer import MCMC, NUTS, init_to_median
-    nuts_kernel = NUTS(model, init_strategy=init_to_median)
+    nuts_kernel = NUTS(
+        model, 
+        init_strategy=init_to_median,
+        max_tree_depth=8,  # Reduce tree depth to save memory
+        target_accept_prob=0.8  # Slightly lower acceptance rate for efficiency
+    )
     
     # Run MCMC
-    logging.info("Running MCMC...")
+    logging.info("Running MCMC for GMRF model...")
     mcmc = MCMC(
         nuts_kernel,
-        num_warmup=args.pnum // 2,  # Use half for warmup
+        num_warmup=args.pnum // 4,  # Use quarter for warmup to save memory
         num_samples=args.pnum,
-        num_chains=4,  # Run multiple chains
+        num_chains=1,  # Use single chain to reduce memory
         progress_bar=True
     )
     
@@ -296,23 +249,32 @@ def run_ising_inference(data, args):
     samples = mcmc.get_samples()
     logging.info(f"MCMC completed. Sample keys: {list(samples.keys())}")
     
-    # Extract probability matrix samples
-    if 'probs' in samples:
-        post_samples = samples['probs']
-        logging.info(f"Posterior samples shape: {post_samples.shape}")
-    else:
-        logging.warning("No 'probs' found in samples. Creating dummy samples.")
-        post_samples = jnp.zeros((args.pnum, n, C))
+    # Extract parameter samples
+    x_samples = samples.get('x', jnp.zeros((args.pnum, I, C)))
+    p_raw = jax.nn.sigmoid(x_samples)
+    p_samples = jnp.clip(p_raw, 1e-7, 1.0 - 1e-7)
+    
+    post_samples = {
+        'sigma': samples.get('sigma', jnp.zeros(args.pnum)),
+        'gamma': samples.get('gamma', jnp.zeros(args.pnum)),
+        'gamma_mean': samples.get('gamma_mean', jnp.zeros(args.pnum)),
+        'gamma_std2': samples.get('gamma_std2', jnp.zeros(args.pnum)),
+        'beta': samples.get('beta', jnp.zeros((args.pnum, C-1))),
+        'tau': samples.get('tau', jnp.zeros(args.pnum)),
+        'lambda_betas': samples.get('lambda_betas', jnp.zeros((args.pnum, C-1))),
+        'x': x_samples,
+        'p': p_samples
+    }
     
     # Get MCMC diagnostics
     mcmc.print_summary()
     
     # Save results
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    results_dir = f'./Res/ising_{timestamp}'
+    results_dir = f'./Res/gmrf_{timestamp}'
     os.makedirs(results_dir, exist_ok=True)
     
-    np.save(f"{results_dir}/post_samples.npy", np.array(post_samples))
+    np.save(f"{results_dir}/post_samples.npy", {k: np.array(v) for k, v in post_samples.items()})
     np.save(f"{results_dir}/mcmc_samples.npy", {k: np.array(v) for k, v in samples.items()})
     
     logging.info(f"Results saved to {results_dir}")
@@ -321,69 +283,62 @@ def run_ising_inference(data, args):
 
 def main():
     """
-    Main function to run IsingAnisotropic model inference.
+    Main function to run Bayesian model inference (Ising or GMRF).
     
     Parses command line arguments, loads data, and runs Bayesian inference
-    using the IsingAnisotropic model with Numpyro. Results are saved to
-    timestamped directories in the ./Res/ folder.
+    using either the IsingAnisotropic model or Gaussian Markov Random Field (GMRF)
+    model with Numpyro. Results are saved to timestamped directories in the ./Res/ folder.
     
     Command Line Arguments
     ----------------------
     --type : str, default="FDBayes"
         Type of posterior (legacy, not used in Numpyro version)
-    --size : int, default=10
-        Grid size (will be adjusted based on data)
     --theta : float, default=5.0
         True parameter value (for synthetic data)
-    --dnum : int, default=1000
-        Number of data samples to use
-    --pnum : int, default=2000
+    --pnum : int, default=500
         Number of posterior samples
     --numboot : int, default=100
         Number of bootstrap samples (legacy, not used)
-    --batch_size : int, optional
-        Number of patients to use (if not specified, use all)
+    --batch_size : int, default=20
+        Number of patients to use for inference (controls both data loading and inference size)
     --bootstrap : bool, default=False
         Whether to use bootstrap minimizers (legacy, not used)
         
     Examples
     --------
-    Run with default parameters:
+    Run model with default parameters:
     >>> python run_model.py
     
-    Run with custom parameters:
-    >>> python run_model.py --dnum 500 --pnum 1000 --batch_size 100
+    Run  model with custom parameters:
+    >>> python run_model.py --pnum 1000 --batch_size 100
     """
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Run IsingAnisotropic Model Inference with Numpyro')
+    parser = argparse.ArgumentParser(description='Run Bayesian Model Inference with Numpyro')
     parser.add_argument('--type', default="FDBayes", type=str, choices=["FDBayes", "KSDBayes", "PseudoBayes"],
                         help='Type of posterior to use (legacy, not used in Numpyro version)')
-    parser.add_argument('--size', default=10, type=int,
-                        help='Grid size for IsingAnisotropic model (will be adjusted based on data)')
+
     parser.add_argument('--theta', default=5.0, type=float,
                         help='True parameter value (for synthetic data)')
-    parser.add_argument('--dnum', default=1000, type=int,
-                        help='Number of data samples to use')
-    parser.add_argument('--pnum', default=2000, type=int,
+
+    parser.add_argument('--pnum', default=500, type=int,
                         help='Number of posterior samples')
     parser.add_argument('--numboot', default=100, type=int,
                         help='Number of bootstrap samples (legacy, not used in Numpyro version)')
-    parser.add_argument('--batch_size', default=None, type=int,
-                        help='Number of patients to use for inference (if not specified, use all)')
+    parser.add_argument('--batch_size', default=20, type=int,
+                        help='Number of patients to use for inference (if not specified, use 20)')
     parser.add_argument('--bootstrap', default=False, type=bool,
                         help='Whether to use bootstrap minimizers (legacy, not used in Numpyro version)') 
     args = parser.parse_args()
 
     # Set up logging
     log_file = setup_logging()
-    logging.info(f"Starting IsingAnisotropic model run with Numpyro. Arguments: {args}")
+    logging.info(f"Starting model run with Numpyro. Arguments: {args}")
 
     try:
         # Load and preprocess data
         logging.info("Loading data...")
         A, X_cov, condition_list = load_data(batch_size=args.batch_size)
         
-        # For Ising model, we'll use the binary matrix A
         # Take first timepoint if 3D
         if A.ndim == 3:
             A_data = A[:, :, 0]  # Shape: (n_patients, n_conditions)
@@ -391,16 +346,16 @@ def main():
             A_data = A
         
         logging.info(f"Loaded data shape: {A_data.shape}")
-        
-        # Prepare data for Ising model
-        ising_data = prepare_ising_data(A_data, X_cov, condition_list)
-        
-        # Run inference
-        post_samples, times_post, beta_opt, time_bootstrap = run_ising_inference(ising_data, args)
+                    
+        # Prepare data for GMRF model (binary format)
+        gmrf_data = jnp.array(A_data, dtype=jnp.float32)
+            
+        # Run GMRF inference
+        post_samples, times_post, beta_opt, time_bootstrap = run_gmrf_inference(gmrf_data, args)
         
         # Log final results
         logging.info("Inference completed successfully!")
-        logging.info(f"Posterior samples shape: {post_samples.shape}")
+        logging.info(f"Posterior samples keys: {list(post_samples.keys())}")
         logging.info("MCMC diagnostics printed above.")
 
     except Exception as e:
