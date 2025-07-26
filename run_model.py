@@ -145,13 +145,13 @@ def gmrf_model(I, C, data=None):
     
     # Normal-InverseGamma hyperprior for gamma
     gamma_mean = numpyro.sample("gamma_mean", dist.Normal(0, 5))
-    gamma_std2 = numpyro.sample("gamma_std2", dist.InverseGamma(1, 1))
+    gamma_std2 = numpyro.sample("gamma_std2", dist.InverseGamma(2, 2))
     gamma_std = jnp.sqrt(gamma_std2)
     gamma = numpyro.sample("gamma", dist.Normal(gamma_mean, gamma_std))
     
     # Horseshoe prior for betas
     tau = numpyro.sample("tau", dist.HalfCauchy(1.0))
-    lambda_betas = numpyro.sample("lambda_betas", dist.HalfCauchy(3.0 * jnp.ones(C-1)))
+    lambda_betas = numpyro.sample("lambda_betas", dist.HalfCauchy(jnp.ones(C-1)))
     beta = numpyro.sample("beta", dist.Normal(0, tau * lambda_betas))
     
     # Sample the latent grid x from independent Normal (potential term)
