@@ -17,12 +17,12 @@ The project analyzes medical data where:
 The main script orchestrates the entire inference pipeline:
 
 ```python
-python run_model.py --dnum 100 --pnum 500 --batch_size 20
+python run_model.py --pnum 500 --batch_size 20
 ```
 
 **Key Components:**
-- **Data Loading**: Uses `dataloader.py` to load patient data
-- **Model Definition**: Defines the Ising model using `Source/Models.py`
+- **Data Loading**: Uses `dataloader.py` to load patient data (controlled by `batch_size`)
+- **Model Definition**: Defines the Ising model using `Source/Models.py` (grid size determined automatically from data)
 - **Inference Engine**: Uses Numpyro for MCMC sampling
 - **Likelihood Computation**: Uses `Source/JAXFDBayes.py` for efficient computation
 
@@ -168,9 +168,6 @@ python run_model.py --dnum 500 --pnum 1000 --batch_size 100
 ### Parameter Tuning
 
 ```bash
-# Use more data samples
-python run_model.py --dnum 1000
-
 # Use more posterior samples
 python run_model.py --pnum 2000
 

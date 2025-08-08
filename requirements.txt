@@ -35,3 +35,4 @@ networkx>=2.6.0
 
 # Additional utilities
 # Note: Some of these might be optional depending on your specific use case 
+flowMC>=0.4.5 

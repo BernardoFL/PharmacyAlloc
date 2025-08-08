@@ -177,10 +177,11 @@ class Patient:
 
 
 
-def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_file="Data/drug_mapping_table.csv", drug_condition_file="Data/drug_condition_atc_table.csv", batch_size=None):
+def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_file="Data/drug_mapping_table.csv", drug_condition_file="Data/drug_condition_atc_table.csv", batch_size=None, start_index=0):
     """
     Constructs a list of Patient objects from three CSV files.
-    If batch_size is specified, only the first batch_size patients are loaded.
+    If batch_size is specified, only batch_size patients starting from start_index are loaded.
+    If start_index is specified, only patients starting from that index are loaded.
     """
     # Read CSV files.
     df_main = pd.read_csv(main_file)
@@ -212,6 +213,8 @@ def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_fil
     
     # Group rows by person_id.
     grouped = list(df_main.groupby('person_id'))
+    if start_index > 0:
+        grouped = grouped[start_index:]
     if batch_size is not None:
         grouped = grouped[:batch_size]
     for person_id, df_patient in grouped:
@@ -514,18 +517,19 @@ def get_all_conditions_from_drugs(patients):
 # Example usage:
 # conditions = get_all_conditions_from_drugs(patients)
 # print("Conditions from drugs:", conditions)
-def load_data(batch_size=None):
+def load_data(batch_size=None, start_index=0):
     """
     Load and preprocess data, returning JAX arrays.
     Uses cached data if available.
-    If batch_size is specified, only the first batch_size patients are loaded.
+    If batch_size is specified, only batch_size patients starting from start_index are loaded.
+    If start_index is specified, only patients starting from that index are loaded.
     """
     # Check for cached data
     cache_file = 'Data/cached/preprocessed_data.npz'
     condition_cache = 'Data/cached/condition_list.pkl'
     
-    # Only use cache if batch_size is None
-    if batch_size is None and os.path.exists(cache_file) and os.path.exists(condition_cache):
+    # Only use cache if batch_size is None and start_index is 0
+    if batch_size is None and start_index == 0 and os.path.exists(cache_file) and os.path.exists(condition_cache):
         # Load from cache
         cached_data = np.load(cache_file)
         A = jnp.array(cached_data['A'])
@@ -539,8 +543,8 @@ def load_data(batch_size=None):
         A = 2 * A - 1
         return A, X_cov, condition_list
     
-    # If no cache or batch_size is specified, load and process as before
-    patients = load_patients_from_csv_files(batch_size=batch_size)
+    # If no cache or batch_size/start_index is specified, load and process as before
+    patients = load_patients_from_csv_files(batch_size=batch_size, start_index=start_index)
     #remove patients with no drugs
     for patient in patients:
         for visit in patient.visits:
@@ -552,8 +556,8 @@ def load_data(batch_size=None):
     X_cov = construct_covariate_matrix(patients)
     condition_list = get_all_conditions_from_drugs(patients)
     
-    # Only save cache if batch_size is None
-    if batch_size is None:
+    # Only save cache if batch_size is None and start_index is 0
+    if batch_size is None and start_index == 0:
         np.savez(cache_file, A=A, X_cov=X_cov)
         with open(condition_cache, 'wb') as f:
             import pickle
