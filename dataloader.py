@@ -177,10 +177,10 @@ class Patient:
 
 
 
-def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_file="Data/drug_mapping_table.csv", drug_condition_file="Data/drug_condition_atc_table.csv", batch_size=None):
+def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_file="Data/drug_mapping_table.csv", drug_condition_file="Data/drug_condition_atc_table.csv", start_idx=None, end_idx=None):
     """
     Constructs a list of Patient objects from three CSV files.
-    If batch_size is specified, only the first batch_size patients are loaded.
+    If start_idx and end_idx are specified, only patients within that range are loaded.
     """
     # Read CSV files.
     df_main = pd.read_csv(main_file)
@@ -212,8 +212,11 @@ def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_fil
     
     # Group rows by person_id.
     grouped = list(df_main.groupby('person_id'))
-    if batch_size is not None:
-        grouped = grouped[:batch_size]
+    
+    # Slice the grouped data if indices are provided
+    if start_idx is not None and end_idx is not None:
+        grouped = grouped[start_idx:end_idx]
+        
     for person_id, df_patient in grouped:
         visits = []
         # We'll collect conditions for this patient in a dictionary mapping condition name to Condition object.
@@ -291,8 +294,6 @@ def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_fil
         patients.append(patient_obj)
     
     return patients
-# Example call:
-# patients = load_patients_from_csv_files("main.csv", "conversion.csv", "drug_condition_atc_table.csv")
 
 def construct_A_matrix(patients: List[Patient]) -> Tuple[jnp.ndarray, Dict[str, int]]:
     """
@@ -514,19 +515,16 @@ def get_all_conditions_from_drugs(patients):
 # Example usage:
 # conditions = get_all_conditions_from_drugs(patients)
 # print("Conditions from drugs:", conditions)
-def load_data(batch_size=None):
+def load_data(patient_start_idx=None, patient_end_idx=None):
     """
     Load and preprocess data, returning JAX arrays.
-    Uses cached data if available.
-    If batch_size is specified, only the first batch_size patients are loaded.
+    Uses cached data if available and no specific patient range is requested.
     """
-    # Check for cached data
     cache_file = 'Data/cached/preprocessed_data.npz'
     condition_cache = 'Data/cached/condition_list.pkl'
     
-    # Only use cache if batch_size is None
-    if batch_size is None and os.path.exists(cache_file) and os.path.exists(condition_cache):
-        # Load from cache
+    # Only use cache if no specific patient range is requested
+    if patient_start_idx is None and patient_end_idx is None and os.path.exists(cache_file) and os.path.exists(condition_cache):
         cached_data = np.load(cache_file)
         A = jnp.array(cached_data['A'])
         X_cov = jnp.array(cached_data['X_cov'])
@@ -535,29 +533,31 @@ def load_data(batch_size=None):
             import pickle
             condition_list = pickle.load(f)
         
-        # Convert A from {0,1} to {-1,1} data
         A = 2 * A - 1
         return A, X_cov, condition_list
     
-    # If no cache or batch_size is specified, load and process as before
-    patients = load_patients_from_csv_files(batch_size=batch_size)
-    #remove patients with no drugs
+    # Load a specific slice of patients if indices are provided
+    patients = load_patients_from_csv_files(start_idx=patient_start_idx, end_idx=patient_end_idx)
+    
     for patient in patients:
         for visit in patient.visits:
-            # Reassign the drugs list to only those drugs that have a non-empty atcs attribute.
             visit["drugs"] = [drug for drug in visit["drugs"] 
                             if hasattr(drug, "atcs") and drug.atcs is not None and len(drug.atcs) > 0]
 
     A, condition_to_index = construct_A_matrix(patients)
     X_cov = construct_covariate_matrix(patients)
-    condition_list = get_all_conditions_from_drugs(patients)
     
-    # Only save cache if batch_size is None
-    if batch_size is None:
+    # For consistency, we should load the full condition list, not just from the shard
+    full_condition_list = get_all_conditions_from_drugs(load_patients_from_csv_files())
+    
+    # Cache the full dataset if it was loaded
+    if patient_start_idx is None and patient_end_idx is None:
+        if not os.path.exists('Data/cached'):
+            os.makedirs('Data/cached')
         np.savez(cache_file, A=A, X_cov=X_cov)
         with open(condition_cache, 'wb') as f:
             import pickle
-            pickle.dump(condition_list, f)
+            pickle.dump(full_condition_list, f)
     
-    return A, X_cov, condition_list
+    return A, X_cov, full_condition_list
 

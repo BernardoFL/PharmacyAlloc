@@ -33,6 +33,7 @@ from numpyro.infer.util import initialize_model
 from Source.NumpyroDistributions import IsingAnisotropicDistribution
 from dataloader import load_data
 from Source.JAXFDBayes import JAXFDBayes
+from knn_utils import load_patient_knn, load_condition_knn
 
 def setup_logging(log_dir='logs'):
     """
@@ -73,212 +74,171 @@ def setup_logging(log_dir='logs'):
     logging.info(f"Logging to {log_file}")
     return log_file
 
-def prepare_ising_data(A_sorted, X_cov_sorted, condition_list):
+def create_adjacency_matrix(knn_indices):
     """
-    Prepare data for IsingAnisotropic model inference.
-    
-    Converts medical data matrices to JAX arrays suitable for Ising model analysis.
-    The binary matrix A_sorted is used as the main data, where each patient
-    represents a sample and conditions represent variables.
+    Create a sparse, symmetric, binary adjacency matrix from KNN indices.
     
     Parameters
     ----------
-    A_sorted : numpy.ndarray
-        Binary matrix of shape (n_patients, n_conditions) indicating presence/absence
-        of conditions for each patient.
-    X_cov_sorted : numpy.ndarray
-        Covariate matrix (not used in current implementation but kept for compatibility).
-    condition_list : list
-        List of condition names (not used in current implementation but kept for compatibility).
+    knn_indices : numpy.ndarray
+        Array of shape (n_items, k_neighbors) with indices of nearest neighbors.
+        It is assumed that the first column is the item itself and should be ignored.
         
     Returns
     -------
-    jax.numpy.ndarray
-        JAX array of shape (n_patients, n_conditions) with dtype float32.
+    numpy.ndarray
+        A sparse, symmetric, binary adjacency matrix (n_items, n_items).
+    """
+    n_items = knn_indices.shape[0]
+    W = np.zeros((n_items, n_items), dtype=np.int32)
+
+    for i in range(n_items):
+        # The first neighbor returned by sklearn's NearestNeighbors is the point itself.
+        # We want neighbors, so we skip the first one.
+        neighbors = knn_indices[i, 1:]
+        W[i, neighbors] = 1
         
-    Examples
-    --------
-    >>> A = np.random.randint(0, 2, size=(100, 50))
-    >>> X_cov = np.random.randn(100, 5)
-    >>> conditions = [f"condition_{i}" for i in range(50)]
-    >>> data = prepare_ising_data(A, X_cov, conditions)
-    >>> print(data.shape)  # (100, 50)
+    # Make the matrix symmetric
+    W = np.maximum(W, W.T)
+    
+    return W
+
+def compute_graph_laplacian(W):
     """
-    logging.info("Preparing data for IsingAnisotropic model...")
-    
-    # Use the binary matrix A_sorted as the main data
-    # A_sorted shape: (n_patients, n_conditions)
-    # We'll treat each patient as a sample and conditions as variables
-    
-    # Convert to jax array
-    data_array = jnp.array(A_sorted, dtype=jnp.float32)
-    
-    logging.info(f"Prepared Ising data shape: {data_array.shape}")
-    logging.info(f"Data statistics: mean={data_array.mean():.4f}, std={data_array.std():.4f}")
-    logging.info(f"Binary values: {jnp.unique(data_array)}")
-    
-    return data_array
-
-
-
-def gmrf_model(I, C, data=None):
+    Compute the graph Laplacian from an adjacency matrix.
+    L = D - W, where D is the diagonal degree matrix of W.
     """
-    Numpyro model for Gaussian Markov Random Field (GMRF) inference.
-    
-    The model implements:
-    1. Hyperpriors for sigma, gamma, and beta parameters
-    2. Latent grid x with GMRF prior
-    3. Probability grid p = sigmoid(x)
-    4. Likelihood for observed binary data
+    D = np.diag(np.sum(W, axis=1))
+    L = D - W
+    return L
+
+def gmrf_model(L_rows, L_cols, y):
+    """
+    Gaussian Markov Random Field model with separable row and column dependencies.
     
     Parameters
     ----------
-    I : int
-        Number of rows (patients)
-    C : int
-        Number of columns (conditions)
-    data : jax.numpy.ndarray, optional
-        Observed binary data of shape (I, C) with values in {0, 1}
+    L_rows : jax.numpy.ndarray
+        Graph Laplacian for rows (patients).
+    L_cols : jax.numpy.ndarray
+        Graph Laplacian for columns (conditions).
+    y : jax.numpy.ndarray
+        Observed binary data matrix.
     """
-    # Define hyperpriors
-    sigma = numpyro.sample("sigma", dist.HalfCauchy(1.0))
-    
-    # Normal-InverseGamma hyperprior for gamma
-    gamma_mean = numpyro.sample("gamma_mean", dist.Normal(0, 5))
-    gamma_std2 = numpyro.sample("gamma_std2", dist.InverseGamma(2, 2))
-    gamma_std = jnp.sqrt(gamma_std2)
-    gamma = numpyro.sample("gamma", dist.Normal(gamma_mean, gamma_std))
-    
-    # Horseshoe prior for betas
-    tau = numpyro.sample("tau", dist.HalfCauchy(1.0))
-    lambda_betas = numpyro.sample("lambda_betas", dist.HalfCauchy(jnp.ones(C-1)))
-    beta = numpyro.sample("beta", dist.Normal(0, tau * lambda_betas))
-    
-    # Sample the latent grid x from independent Normal (potential term)
-    # This efficiently implements the potential term -x^2/(2*sigma^2)
-    x = numpyro.sample("x", dist.Normal(0, sigma).expand([I, C]))
-    
-    # Add GMRF interaction terms using numpyro.factor
-    
-    # Vertical interactions (between rows): gamma * sum(x[i,c] * x[i+1,c])
-    v_potential = gamma * jnp.sum(x[:-1, :] * x[1:, :])
-    numpyro.factor("v_interact", v_potential)
-    
-    # Horizontal interactions (between columns): sum(beta[c] * sum(x[i,c] * x[i,c+1]))
-    h_potential = jnp.sum(beta * jnp.sum(x[:, :-1] * x[:, 1:], axis=0))
-    numpyro.factor("h_interact", h_potential)
-    
-    # Transform to probabilities using sigmoid with clipping to prevent extreme values
-    p_raw = jax.nn.sigmoid(x)
-    p = jnp.clip(p_raw, 1e-7, 1.0 - 1e-7)
-    
-    # Add likelihood for observed data if provided
-    if data is not None:
-        # Use binomial likelihood for binary data
-        numpyro.sample("obs", dist.Binomial(total_count=1, probs=p), obs=data)
-    
-    return p
+    I, C = y.shape  # I = patients (rows), C = conditions (columns)
 
+    # --- Define Priors ---
+
+    # Patient/Row term with a Gaussian prior
+    J_v = numpyro.sample("J_v", dist.Normal(0.0, 1.0))
+
+    # Condition/Column term with a Horseshoe prior (non-centered parameterization)
+    # Global shrinkage parameter (tau)
+    tau = numpyro.sample("tau", dist.HalfCauchy(1.0))
+    # Local shrinkage parameters (lambda_i)
+    lambdas = numpyro.sample("lambdas", dist.HalfCauchy(1.0).expand([C]))
+    # Sample unscaled beta parameters from a standard Normal
+    beta_unscaled = numpyro.sample("beta_unscaled", dist.Normal(0.0, 1.0).expand([C]))
+    # Scale them to get the final beta parameters
+    beta = numpyro.deterministic("beta", beta_unscaled * tau * lambdas)
+
+    # Latent Field
+    Lambda = numpyro.sample("Lambda", dist.Normal(0, 1.0).expand([I, C]))
+
+    # --- Impose GMRF Structure ---
+    
+    # Vertical Energy (Row/Patient Interactions) - Governed by a single J_v
+    U_vertical = J_v * jnp.trace(Lambda.T @ L_rows @ Lambda)
+    numpyro.factor("v_interact", -0.5 * U_vertical)
+
+    # Horizontal Energy (Column/Condition Interactions) - Governed by per-condition betas
+    # We scale the latent variables for each condition by its beta parameter before calculating the energy.
+    Lambda_scaled = Lambda * beta[None, :]  # Broadcasting beta across all patients
+    U_horizontal = jnp.trace(Lambda_scaled @ L_cols @ Lambda_scaled.T)
+    numpyro.factor("h_interact", -0.5 * U_horizontal)
+
+    # Likelihood
+    numpyro.sample("obs", dist.Bernoulli(logits=Lambda), obs=y)
 
 def run_gmrf_inference(data, args):
     """
-    Run Gaussian Markov Random Field (GMRF) model inference using Numpyro MCMC.
-    
-    Performs Bayesian inference on the GMRF model using NUTS (No-U-Turn Sampler)
-    with multiple chains. The model samples probability matrices and uses binomial likelihood.
-    
-    Parameters:
-    -----------
-    data : jax.numpy.ndarray
-        Input binary data matrix of shape (n_patients, n_conditions) with values in {0, 1}
-    args : argparse.Namespace
-        Command line arguments containing inference parameters
-        
-    Returns:
-    -------
-    tuple
-        A tuple containing posterior samples and timing information
+    Run GMRF model inference.
+
+    Performs pre-computation of adjacency and Laplacian matrices, and then
+    runs Bayesian inference using NUTS.
     """
     logging.info("Starting GMRF model inference with Numpyro...")
-    
-    # Set random seeds for reproducibility
     key = random.PRNGKey(0)
     
-    # Ensure data is binary {0, 1}
     binary_data = jnp.where(data > 0.5, 1, 0)
-    
-    # Determine grid dimensions
-    I, C = binary_data.shape  # I = patients (rows), C = conditions (columns)
-    
-    logging.info(f"Using GMRF grid size: I={I} (patients), C={C} (conditions)")
-    logging.info(f"Grid size: {I} × {C} = {I * C}")
-    
-    # Prepare data for the model
-    inference_data = binary_data
-    
-    logging.info(f"Data shape: {inference_data.shape}")
-    logging.info(f"Binary values: {jnp.unique(inference_data)}")
-    logging.info(f"Data statistics: mean={inference_data.mean():.4f}, std={inference_data.std():.4f}")
+    N, C = binary_data.shape
+    logging.info(f"Using GMRF model: N={N} (patients), C={C} (conditions)")
 
-    # Create Numpyro model
-    model = lambda: gmrf_model(I, C, inference_data)
+    # --- Pre-computation Steps ---
+    logging.info("Performing pre-computation for GMRF...")
     
-    # Set up NUTS sampler with memory-efficient settings
-    from numpyro.infer import MCMC, NUTS, init_to_median
-    nuts_kernel = NUTS(
-        model, 
-        init_strategy=init_to_median,
-        max_tree_depth=8,  # Reduce tree depth to save memory
-        target_accept_prob=0.8  # Slightly lower acceptance rate for efficiency
-    )
+    # 1. Load KNN data
+    patient_knn = load_patient_knn(lazy_load=True)
+    condition_knn = load_condition_knn(lazy_load=True)
+
+    # 2. Create Adjacency Matrices from the full dataset
+    logging.info("Creating full adjacency matrices from KNN data...")
+    W_rows_full = create_adjacency_matrix(patient_knn['indices'])
+    W_cols_full = create_adjacency_matrix(condition_knn['indices'])
     
-    # Run MCMC
+    # 3. Subset adjacency matrices to match the data batch
+    # This assumes that the `data` (A_data from main) corresponds to the first N patients
+    # and C conditions from the original dataset.
+    logging.info(f"Subsetting adjacency matrices for batch size: N={N}, C={C}")
+    W_rows = W_rows_full[:N, :N]
+    W_cols = W_cols_full[:C, :C]
+
+    # 4. Compute Graph Laplacians for the batch
+    logging.info("Computing graph Laplacians for the batch...")
+    L_rows = compute_graph_laplacian(W_rows)
+    L_cols = compute_graph_laplacian(W_cols)
+    
+    # Convert to JAX arrays
+    L_rows = jnp.array(L_rows, dtype=jnp.float32)
+    L_cols = jnp.array(L_cols, dtype=jnp.float32)
+
+    logging.info(f"Row Laplacian shape: {L_rows.shape}")
+    logging.info(f"Column Laplacian shape: {L_cols.shape}")
+
+    # --- NumPyro Model Inference ---
+    model = lambda: gmrf_model(L_rows, L_cols, binary_data)
+    
+    nuts_kernel = NUTS(model)
+    
     logging.info("Running MCMC for GMRF model...")
     mcmc = MCMC(
         nuts_kernel,
-        num_warmup=args.pnum // 4,  # Use quarter for warmup to save memory
+        num_warmup=2 * args.pnum,  # Increased warmup steps
         num_samples=args.pnum,
-        num_chains=1,  # Use single chain to reduce memory
-        progress_bar=True
+        num_chains=4,
+        progress_bar=True,
+        jit_model_args=True,
+        chain_method='parallel'
     )
-    
-    # Run the MCMC
     mcmc.run(key)
     
-    # Get samples
     samples = mcmc.get_samples()
     logging.info(f"MCMC completed. Sample keys: {list(samples.keys())}")
     
-    # Extract parameter samples
-    x_samples = samples.get('x', jnp.zeros((args.pnum, I, C)))
-    p_raw = jax.nn.sigmoid(x_samples)
-    p_samples = jnp.clip(p_raw, 1e-7, 1.0 - 1e-7)
-    
-    post_samples = {
-        'sigma': samples.get('sigma', jnp.zeros(args.pnum)),
-        'gamma': samples.get('gamma', jnp.zeros(args.pnum)),
-        'gamma_mean': samples.get('gamma_mean', jnp.zeros(args.pnum)),
-        'gamma_std2': samples.get('gamma_std2', jnp.zeros(args.pnum)),
-        'beta': samples.get('beta', jnp.zeros((args.pnum, C-1))),
-        'tau': samples.get('tau', jnp.zeros(args.pnum)),
-        'lambda_betas': samples.get('lambda_betas', jnp.zeros((args.pnum, C-1))),
-        'x': x_samples,
-        'p': p_samples
-    }
-    
-    # Get MCMC diagnostics
     mcmc.print_summary()
     
     # Save results
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    results_dir = f'./Res/gmrf_{timestamp}'
+    shard_suffix = f"_shard_{args.shard_id}" if args.shard_id is not None else ""
+    results_dir = f'./Res/gmrf_{timestamp}{shard_suffix}'
     os.makedirs(results_dir, exist_ok=True)
     
-    np.save(f"{results_dir}/post_samples.npy", {k: np.array(v) for k, v in post_samples.items()})
     np.save(f"{results_dir}/mcmc_samples.npy", {k: np.array(v) for k, v in samples.items()})
     
     logging.info(f"Results saved to {results_dir}")
     
+    # To maintain function signature from main
+    post_samples = {k: np.array(v) for k, v in samples.items()}
     return post_samples, None, None, None
 
 def main():
@@ -328,8 +288,15 @@ def main():
                         help='Number of patients to use for inference (if not specified, use 20)')
     parser.add_argument('--bootstrap', default=False, type=bool,
                         help='Whether to use bootstrap minimizers (legacy, not used in Numpyro version)') 
+    parser.add_argument('--start_idx', default=None, type=int,
+                        help='Starting index for patient data slicing.')
+    parser.add_argument('--end_idx', default=None, type=int,
+                        help='Ending index for patient data slicing.')
+    parser.add_argument('--shard_id', default=None, type=int,
+                        help='Identifier for the current shard.')
     args = parser.parse_args()
 
+    numpyro.set_host_device_count(4)
     # Set up logging
     log_file = setup_logging()
     logging.info(f"Starting model run with Numpyro. Arguments: {args}")
@@ -337,7 +304,10 @@ def main():
     try:
         # Load and preprocess data
         logging.info("Loading data...")
-        A, X_cov, condition_list = load_data(batch_size=args.batch_size)
+        A, X_cov, condition_list = load_data(
+            patient_start_idx=args.start_idx, 
+            patient_end_idx=args.end_idx
+        )
         
         # Take first timepoint if 3D
         if A.ndim == 3:
