@@ -23,6 +23,7 @@ import jax.numpy as jnp
 from jax.experimental.sparse import BCOO
 from jax import random
 from datetime import datetime
+from collections import defaultdict
 
 # Import Numpyro modules
 import numpyro
@@ -75,53 +76,90 @@ def setup_logging(log_dir='logs'):
     logging.info(f"Logging to {log_file}")
     return log_file
 
-def create_adjacency_matrix(knn_indices):
+def create_neighbor_hash_tables(knn_indices, max_neighbors=10):
     """
-    Create a sparse, symmetric, binary adjacency matrix from KNN indices.
+    Create hash tables for caching nearest neighbors with k ≤ 10 restriction.
     
     Parameters
     ----------
     knn_indices : numpy.ndarray
         Array of shape (n_items, k_neighbors) with indices of nearest neighbors.
         It is assumed that the first column is the item itself and should be ignored.
+    max_neighbors : int, default=10
+        Maximum number of neighbors to cache per item (k ≤ 10 restriction).
         
     Returns
     -------
-    scipy.sparse.csr_matrix
-        A sparse, symmetric, binary adjacency matrix (n_items, n_items).
+    dict
+        A dictionary mapping item indices to lists of neighbor indices (max 10 per item).
     """
+    if max_neighbors > 10:
+        raise ValueError(f"max_neighbors must be ≤ 10, got {max_neighbors}")
+    
+    neighbor_tables = {}
     n_items = knn_indices.shape[0]
-    rows = np.repeat(np.arange(n_items), knn_indices.shape[1] - 1)
-    cols = knn_indices[:, 1:].flatten()
-    data = np.ones_like(rows)
     
-    W = sp.csr_matrix((data, (rows, cols)), shape=(n_items, n_items), dtype=np.int32)
+    for i in range(n_items):
+        # Get neighbors (excluding self, which is typically the first column)
+        neighbors = knn_indices[i, 1:].tolist()
+        # Apply k ≤ 10 restriction
+        neighbors = neighbors[:max_neighbors]
+        neighbor_tables[i] = neighbors
     
-    # Make the matrix symmetric
-    W = W + W.T
-    W[W > 1] = 1
-    
-    return W
+    return neighbor_tables
 
-def compute_graph_laplacian(W):
+def compute_neighbor_energy(Lambda, neighbor_table, beta_values=None):
     """
-    Compute the graph Laplacian from a sparse adjacency matrix.
-    L = D - W, where D is the diagonal degree matrix of W.
-    """
-    D = sp.diags(W.sum(axis=1).A1, format='csr')
-    L = D - W
-    return L
-
-def gmrf_model(L_rows, L_cols, y):
-    """
-    Gaussian Markov Random Field model with separable row and column dependencies.
+    Compute the energy contribution from neighbor interactions using hash table lookup.
     
     Parameters
     ----------
-    L_rows : jax.experimental.sparse.BCOO
-        Graph Laplacian for rows (patients).
-    L_cols : jax.experimental.sparse.BCOO
-        Graph Laplacian for columns (conditions).
+    Lambda : jax.numpy.ndarray
+        Latent field matrix of shape (n_items, n_features) or (n_features, n_items).
+    neighbor_table : dict
+        Hash table mapping item indices to neighbor indices.
+    beta_values : jax.numpy.ndarray, optional
+        Beta values for scaling interactions. If None, uses uniform scaling.
+        
+    Returns
+    -------
+    float
+        Total energy contribution from neighbor interactions.
+    """
+    total_energy = 0.0
+    
+    for item_idx, neighbors in neighbor_table.items():
+        if len(neighbors) == 0:
+            continue
+            
+        # Get the latent values for current item and its neighbors
+        item_latent = Lambda[item_idx]
+        neighbor_latents = Lambda[neighbors]
+        
+        # Compute squared differences with neighbors
+        if beta_values is not None:
+            # Use per-item beta values for scaling
+            beta = beta_values[item_idx] if item_idx < len(beta_values) else 1.0
+        else:
+            beta = 1.0
+            
+        # Sum of squared differences with all neighbors
+        squared_diffs = jnp.sum((item_latent - neighbor_latents) ** 2, axis=1)
+        energy_contribution = beta * jnp.sum(squared_diffs)
+        total_energy += energy_contribution
+    
+    return total_energy
+
+def gmrf_model_hash_tables(patient_neighbors, condition_neighbors, y):
+    """
+    Gaussian Markov Random Field model using hash tables for O(n) neighbor computation.
+    
+    Parameters
+    ----------
+    patient_neighbors : dict
+        Hash table mapping patient indices to neighbor indices (max 10 per patient).
+    condition_neighbors : dict
+        Hash table mapping condition indices to neighbor indices (max 10 per condition).
     y : jax.numpy.ndarray
         Observed binary data matrix.
     """
@@ -144,23 +182,29 @@ def gmrf_model(L_rows, L_cols, y):
     # Latent Field
     Lambda = numpyro.sample("Lambda", dist.Normal(0, 1.0).expand([I, C]))
 
-    # --- Impose GMRF Structure ---
+    # --- Impose GMRF Structure using Hash Tables ---
     
-    # Define a function for the quadratic form using efficient sparse matrix-vector products
-    def sparse_quadratic_form(x, L):
-        """Computes x^T L x for a vector x and sparse matrix L."""
-        return x.T @ (L @ x)
-
-    # Vertical Energy (Row/Patient Interactions) - Governed by a single J_v
-    # Use vmap to compute the quadratic form for each column of Lambda
-    U_vertical_per_col = jax.vmap(sparse_quadratic_form, in_axes=(1, None), out_axes=0)(Lambda, L_rows)
+    # Vertical Energy (Row/Patient Interactions) - Governed by a single beta_pat
+    # Compute energy for each column of Lambda using patient neighbor tables
+    def vertical_energy_per_col(col_idx):
+        col_latent = Lambda[:, col_idx]
+        return compute_neighbor_energy(col_latent, patient_neighbors, None)
+    
+    # Use vmap to compute energy for all columns
+    U_vertical_per_col = jax.vmap(vertical_energy_per_col)(jnp.arange(C))
     U_vertical = beta_pat * jnp.sum(U_vertical_per_col)
     numpyro.factor("v_interact", -0.5 * U_vertical)
 
     # Horizontal Energy (Column/Condition Interactions) - Governed by per-condition betas
+    # Scale Lambda by condition betas
     Lambda_scaled = Lambda * beta_cond[None, :]  # Broadcasting beta across all patients
-    # Use vmap to compute the quadratic form for each row of Lambda_scaled
-    U_horizontal_per_row = jax.vmap(sparse_quadratic_form, in_axes=(0, None), out_axes=0)(Lambda_scaled, L_cols)
+    
+    def horizontal_energy_per_row(row_idx):
+        row_latent = Lambda_scaled[row_idx, :]
+        return compute_neighbor_energy(row_latent, condition_neighbors, None)
+    
+    # Use vmap to compute energy for all rows
+    U_horizontal_per_row = jax.vmap(horizontal_energy_per_row)(jnp.arange(I))
     U_horizontal = jnp.sum(U_horizontal_per_row)
     numpyro.factor("h_interact", -0.5 * U_horizontal)
 
@@ -169,12 +213,12 @@ def gmrf_model(L_rows, L_cols, y):
 
 def run_gmrf_inference(data, args):
     """
-    Run GMRF model inference.
+    Run GMRF model inference using hash tables for O(n) neighbor computation.
 
-    Performs pre-computation of adjacency and Laplacian matrices, and then
+    Performs pre-computation of neighbor hash tables and then
     runs Bayesian inference using NUTS.
     """
-    logging.info("Starting GMRF model inference with Numpyro...")
+    logging.info("Starting GMRF model inference with hash table optimization...")
     key = random.PRNGKey(0)
     
     binary_data = jnp.where(data > 0.5, 1, 0)
@@ -182,40 +226,35 @@ def run_gmrf_inference(data, args):
     logging.info(f"Using GMRF model: N={N} (patients), C={C} (conditions)")
 
     # --- Pre-computation Steps ---
-    logging.info("Performing pre-computation for GMRF...")
+    logging.info("Performing pre-computation for GMRF with hash tables...")
     
     # 1. Load KNN data
     patient_knn = load_patient_knn(lazy_load=True)
     condition_knn = load_condition_knn(lazy_load=True)
 
-    # 2. Create Adjacency Matrices from the full dataset
-    logging.info("Creating full adjacency matrices from KNN data...")
-    W_rows_full = create_adjacency_matrix(patient_knn['indices'])
-    W_cols_full = create_adjacency_matrix(condition_knn['indices'])
+    # 2. Create neighbor hash tables with k ≤ 10 restriction
+    logging.info("Creating neighbor hash tables with k ≤ 10 restriction...")
+    patient_neighbors_full = create_neighbor_hash_tables(patient_knn['indices'], max_neighbors=10)
+    condition_neighbors_full = create_neighbor_hash_tables(condition_knn['indices'], max_neighbors=10)
     
-    # 3. Subset adjacency matrices to match the data batch
-    # This assumes that the `data` (A_data from main) corresponds to the first N patients
-    # and C conditions from the original dataset.
-    logging.info(f"Subsetting adjacency matrices for batch size: N={N}, C={C}")
-    W_rows = W_rows_full[:N, :N]
-    W_cols = W_cols_full[:C, :C]
+    # 3. Subset neighbor tables to match the data batch
+    logging.info(f"Subsetting neighbor tables for batch size: N={N}, C={C}")
+    patient_neighbors = {i: patient_neighbors_full[i] for i in range(N) if i in patient_neighbors_full}
+    condition_neighbors = {i: condition_neighbors_full[i] for i in range(C) if i in condition_neighbors_full}
 
-    # 4. Compute Graph Laplacians for the batch
-    logging.info("Computing graph Laplacians for the batch...")
-    L_rows_sp = compute_graph_laplacian(W_rows)
-    L_cols_sp = compute_graph_laplacian(W_cols)
+    logging.info(f"Patient neighbor table size: {len(patient_neighbors)}")
+    logging.info(f"Condition neighbor table size: {len(condition_neighbors)}")
     
-    # Convert to JAX BCOO sparse arrays
-    L_rows = BCOO.from_scipy_sparse(L_rows_sp)
-    L_cols = BCOO.from_scipy_sparse(L_cols_sp)
-
-    logging.info(f"Row Laplacian shape: {L_rows.shape}")
-    logging.info(f"Column Laplacian shape: {L_cols.shape}")
+    # Log some statistics about neighbor counts
+    patient_neighbor_counts = [len(neighbors) for neighbors in patient_neighbors.values()]
+    condition_neighbor_counts = [len(neighbors) for neighbors in condition_neighbors.values()]
+    logging.info(f"Patient neighbors per item - min: {min(patient_neighbor_counts)}, max: {max(patient_neighbor_counts)}, mean: {np.mean(patient_neighbor_counts):.2f}")
+    logging.info(f"Condition neighbors per item - min: {min(condition_neighbor_counts)}, max: {max(condition_neighbor_counts)}, mean: {np.mean(condition_neighbor_counts):.2f}")
 
     # --- NumPyro Model Inference ---
-    model = lambda: gmrf_model(L_rows, L_cols, binary_data)
+    model = lambda: gmrf_model_hash_tables(patient_neighbors, condition_neighbors, binary_data)
     
-    kernel = HMCECS(model)
+    kernel = HMCECS(NUTS(model), num_blocks=10)
     
     logging.info("Running MCMC for GMRF model with HMCECS kernel...")
     mcmc = MCMC(
