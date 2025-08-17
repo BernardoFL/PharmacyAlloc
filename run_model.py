@@ -16,10 +16,11 @@ import math
 import time
 import numpy as np
 import pandas as pd
-import scipy
+import scipy.sparse as sp
 from tqdm import tqdm
 import jax
 import jax.numpy as jnp
+from jax.experimental.sparse import BCOO
 from jax import random
 from datetime import datetime
 
@@ -86,29 +87,28 @@ def create_adjacency_matrix(knn_indices):
         
     Returns
     -------
-    numpy.ndarray
+    scipy.sparse.csr_matrix
         A sparse, symmetric, binary adjacency matrix (n_items, n_items).
     """
     n_items = knn_indices.shape[0]
-    W = np.zeros((n_items, n_items), dtype=np.int32)
-
-    for i in range(n_items):
-        # The first neighbor returned by sklearn's NearestNeighbors is the point itself.
-        # We want neighbors, so we skip the first one.
-        neighbors = knn_indices[i, 1:]
-        W[i, neighbors] = 1
-        
+    rows = np.repeat(np.arange(n_items), knn_indices.shape[1] - 1)
+    cols = knn_indices[:, 1:].flatten()
+    data = np.ones_like(rows)
+    
+    W = sp.csr_matrix((data, (rows, cols)), shape=(n_items, n_items), dtype=np.int32)
+    
     # Make the matrix symmetric
-    W = np.maximum(W, W.T)
+    W = W + W.T
+    W[W > 1] = 1
     
     return W
 
 def compute_graph_laplacian(W):
     """
-    Compute the graph Laplacian from an adjacency matrix.
+    Compute the graph Laplacian from a sparse adjacency matrix.
     L = D - W, where D is the diagonal degree matrix of W.
     """
-    D = np.diag(np.sum(W, axis=1))
+    D = sp.diags(W.sum(axis=1).A1, format='csr')
     L = D - W
     return L
 
@@ -118,9 +118,9 @@ def gmrf_model(L_rows, L_cols, y):
     
     Parameters
     ----------
-    L_rows : jax.numpy.ndarray
+    L_rows : jax.experimental.sparse.BCOO
         Graph Laplacian for rows (patients).
-    L_cols : jax.numpy.ndarray
+    L_cols : jax.experimental.sparse.BCOO
         Graph Laplacian for columns (conditions).
     y : jax.numpy.ndarray
         Observed binary data matrix.
@@ -129,8 +129,8 @@ def gmrf_model(L_rows, L_cols, y):
 
     # --- Define Priors ---
 
-    # Patient/Row term with a Gaussian prior
-    J_v = numpyro.sample("J_v", dist.Normal(0.0, 1.0))
+    # Patient/Row term with a more constrained Gaussian prior
+    J_v = numpyro.sample("J_v", dist.Normal(0.0, 0.1))
 
     # Condition/Column term with a Horseshoe prior (non-centered parameterization)
     # Global shrinkage parameter (tau)
@@ -147,14 +147,22 @@ def gmrf_model(L_rows, L_cols, y):
 
     # --- Impose GMRF Structure ---
     
+    # Define a function for the quadratic form using efficient sparse matrix-vector products
+    def sparse_quadratic_form(x, L):
+        """Computes x^T L x for a vector x and sparse matrix L."""
+        return x.T @ (L @ x)
+
     # Vertical Energy (Row/Patient Interactions) - Governed by a single J_v
-    U_vertical = J_v * jnp.trace(Lambda.T @ L_rows @ Lambda)
+    # Use vmap to compute the quadratic form for each column of Lambda
+    U_vertical_per_col = jax.vmap(sparse_quadratic_form, in_axes=(1, None), out_axes=0)(Lambda, L_rows)
+    U_vertical = J_v * jnp.sum(U_vertical_per_col)
     numpyro.factor("v_interact", -0.5 * U_vertical)
 
     # Horizontal Energy (Column/Condition Interactions) - Governed by per-condition betas
-    # We scale the latent variables for each condition by its beta parameter before calculating the energy.
     Lambda_scaled = Lambda * beta[None, :]  # Broadcasting beta across all patients
-    U_horizontal = jnp.trace(Lambda_scaled @ L_cols @ Lambda_scaled.T)
+    # Use vmap to compute the quadratic form for each row of Lambda_scaled
+    U_horizontal_per_row = jax.vmap(sparse_quadratic_form, in_axes=(0, None), out_axes=0)(Lambda_scaled, L_cols)
+    U_horizontal = jnp.sum(U_horizontal_per_row)
     numpyro.factor("h_interact", -0.5 * U_horizontal)
 
     # Likelihood
@@ -195,12 +203,12 @@ def run_gmrf_inference(data, args):
 
     # 4. Compute Graph Laplacians for the batch
     logging.info("Computing graph Laplacians for the batch...")
-    L_rows = compute_graph_laplacian(W_rows)
-    L_cols = compute_graph_laplacian(W_cols)
+    L_rows_sp = compute_graph_laplacian(W_rows)
+    L_cols_sp = compute_graph_laplacian(W_cols)
     
-    # Convert to JAX arrays
-    L_rows = jnp.array(L_rows, dtype=jnp.float32)
-    L_cols = jnp.array(L_cols, dtype=jnp.float32)
+    # Convert to JAX BCOO sparse arrays
+    L_rows = BCOO.from_scipy_sparse(L_rows_sp)
+    L_cols = BCOO.from_scipy_sparse(L_cols_sp)
 
     logging.info(f"Row Laplacian shape: {L_rows.shape}")
     logging.info(f"Column Laplacian shape: {L_cols.shape}")
@@ -208,12 +216,12 @@ def run_gmrf_inference(data, args):
     # --- NumPyro Model Inference ---
     model = lambda: gmrf_model(L_rows, L_cols, binary_data)
     
-    nuts_kernel = NUTS(model)
+    nuts_kernel = NUTS(model, target_accept_prob=0.9)
     
     logging.info("Running MCMC for GMRF model...")
     mcmc = MCMC(
         nuts_kernel,
-        num_warmup=2 * args.pnum,  # Increased warmup steps
+        num_warmup=1000,
         num_samples=args.pnum,
         num_chains=4,
         progress_bar=True,

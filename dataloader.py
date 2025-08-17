@@ -303,58 +303,37 @@ def construct_A_matrix(patients: List[Patient]) -> Tuple[jnp.ndarray, Dict[str, 
       
     A patient is considered to take condition j at a visit if one of the drugs they take
     in that visit has a Conditions list of length 1 and that single element equals j.
-    
-    Parameters:
-        patients (list): A list of Patient objects. Each Patient should have:
-                  - visits: a list of visit dictionaries, where each visit has a key "drugs"
-                    that holds a list of Drug objects. Each Drug object has an attribute "Conditions"
-                    (a list of strings).
-    
-    Returns:
-        A: A JAX array of shape (N, num_conditions, T_max), where:
-           N is the number of unique patients (by person_id),
-           num_conditions is the number of unique conditions (from drugs with a single condition),
-           T_max is the maximum number of visits any patient has.
-        condition_to_index: A dictionary mapping each unique condition name to its column index in A.
     """
-
-    # First, collect all unique conditions from drugs that have exactly one condition.
-    condition_set = set()
-    for patient in patients:
-        for visit in patient.visits:
-            for drug in visit["drugs"]:
-                if len(drug.Conditions) == 1:
-                    condition_set.add(drug.Conditions[0])
-    unique_conditions = sorted(condition_set)
-    num_conditions = len(unique_conditions)
-    
-    # Build a mapping from condition name to a column index.
-    condition_to_index = {cond: idx for idx, cond in enumerate(unique_conditions)}
-    
-    # Deduplicate patients by person_id.
-    unique_patients_dict = {patient.person_id: patient for patient in patients}
-    unique_patients = sorted(unique_patients_dict.values(), key=lambda p: p.person_id)
-    N = len(unique_patients)
-    
-    # Determine the maximum number of visits across unique patients.
-    T_max = max(len(patient.visits) for patient in unique_patients)
-    
-    # Initialize the A array with zeros.
-    A = jnp.zeros((N, num_conditions, T_max), dtype=jnp.int32)
-    
-    # Fill the matrix:
-    # For each unique patient, for each visit, and for each drug taken in that visit:
-    # if the drug's Conditions list has exactly one element, mark that condition as taken.
-    for i, patient in enumerate(unique_patients):
+    # Create a long-form DataFrame of patient, visit, and drug data
+    records = []
+    for i, patient in enumerate(patients):
         for t, visit in enumerate(patient.visits):
             for drug in visit["drugs"]:
                 if len(drug.Conditions) == 1:
-                    cond = drug.Conditions[0]
-                    if cond in condition_to_index:
-                        j = condition_to_index[cond]
-                        A = A.at[i, j, t].set(1)
-                        
-    return A, condition_to_index
+                    records.append((i, t, drug.Conditions[0]))
+    
+    if not records:
+        # Handle the case where there are no valid drug conditions
+        T_max = max(len(p.visits) for p in patients) if patients else 0
+        return jnp.zeros((len(patients), 0, T_max), dtype=jnp.int32), {}
+
+    df = pd.DataFrame(records, columns=['patient_idx', 'visit_idx', 'condition'])
+    
+    # Get unique conditions and create a mapping to indices
+    unique_conditions = sorted(df['condition'].unique())
+    condition_to_index = {cond: j for j, cond in enumerate(unique_conditions)}
+    df['condition_idx'] = df['condition'].map(condition_to_index)
+    
+    # Get dimensions for the final matrix
+    N = len(patients)
+    num_conditions = len(unique_conditions)
+    T_max = max(len(p.visits) for p in patients)
+    
+    # Create the matrix and fill it using the DataFrame indices
+    A = np.zeros((N, num_conditions, T_max), dtype=np.int32)
+    A[df['patient_idx'], df['condition_idx'], df['visit_idx']] = 1
+    
+    return jnp.array(A), condition_to_index
 
 def construct_covariate_matrix(patients: List[Patient]) -> jnp.ndarray:
     """
@@ -379,34 +358,13 @@ def construct_covariate_matrix(patients: List[Patient]) -> jnp.ndarray:
         return jnp.empty((0, 0, 0))
 
     # --- 1. Extract Static Covariates and Find Max Visits ---
-    static_cov_list = []
-    max_n_visits = 0
-    for i, patient in enumerate(patients):
-        if not hasattr(patient, 'covariates') or not hasattr(patient, 'visits'):
-             raise AttributeError(f"Patient object at index {i} missing 'covariates' or 'visits' attribute.")
-
-        cov = np.array(patient.covariates, dtype=np.float32).flatten()
-        static_cov_list.append(cov)
-        max_n_visits = max(max_n_visits, len(patient.visits))
-
-    # Handle case where no patients have any visits
-    # if max_n_visits == 0:
-    #     logging.warning("No visits found across all patients. Resulting matrix will have 0 visit dimension.")
-        # Or raise ValueError("No visits found in any patient.") depending on desired behavior
-
+    static_cov_list = [np.array(p.covariates, dtype=np.float32).flatten() for p in patients]
+    max_n_visits = max(len(p.visits) for p in patients) if patients else 0
     num_static_covs = len(static_cov_list[0]) if static_cov_list else 0
 
     # --- 2. Get Unique Drugs Across All Visits ---
-    unique_drugs = {}
-    for patient in patients:
-        for visit in patient.visits:
-            if "drugs" not in visit: continue
-            for drug in visit["drugs"]:
-                 if not hasattr(drug, 'rxcui'):
-                      raise AttributeError(f"Drug object {drug} in patient {getattr(patient, 'id', i)}, visit {visit.get('visit_id', 'N/A')} missing 'rxcui' attribute.")
-                 unique_drugs[str(drug.rxcui)] = True
-
-    unique_drug_list = sorted(unique_drugs.keys())
+    all_drugs = [drug for p in patients for v in p.visits for drug in v.get("drugs", [])]
+    unique_drug_list = sorted(list(set(str(d.rxcui) for d in all_drugs if hasattr(d, 'rxcui'))))
     num_unique_drugs = len(unique_drug_list)
     drug_to_index = {rxcui: idx for idx, rxcui in enumerate(unique_drug_list)}
 
@@ -414,55 +372,23 @@ def construct_covariate_matrix(patients: List[Patient]) -> jnp.ndarray:
     n_total_covs = num_static_covs + num_unique_drugs
 
     # --- 3. Build the 3D Matrix with Padding ---
-    all_patient_data = [] # List to hold the data for each patient (each element will be shape (n_total_covs, max_n_visits))
-
-    # Pre-calculate the zero drug vector for padding efficiency
-    zero_drug_indicator = np.zeros(num_unique_drugs, dtype=np.float32)
+    X = np.zeros((n_patients, n_total_covs, max_n_visits), dtype=np.float32)
 
     for i, patient in enumerate(patients):
-        static_covs = static_cov_list[i] # Shape (num_static_covs,)
-        current_n_visits = len(patient.visits)
+        # Add static covariates to all visit slots
+        if num_static_covs > 0:
+            X[i, :num_static_covs, :] = static_cov_list[i][:, np.newaxis]
 
-        # Pre-calculate the feature vector used for padding this patient
-        padding_visit_features = np.concatenate([static_covs, zero_drug_indicator])
-
-        patient_visit_data = [] # List to hold combined features for each visit slot (actual + padded)
-
-        # Process actual visits
-        for visit_idx, visit in enumerate(patient.visits):
-            # Create drug indicator vector for THIS visit
-            visit_drug_indicator = np.zeros(num_unique_drugs, dtype=np.float32)
+        # Add drug indicators for actual visits
+        for t, visit in enumerate(patient.visits):
             if "drugs" in visit:
                 for drug in visit["drugs"]:
                     rxcui_str = str(drug.rxcui)
                     if rxcui_str in drug_to_index:
-                        idx = drug_to_index[rxcui_str]
-                        visit_drug_indicator[idx] = 1.0
-
-            # Concatenate static covariates with the current visit's drug indicator
-            combined_visit_features = np.concatenate([static_covs, visit_drug_indicator])
-            patient_visit_data.append(combined_visit_features)
-
-        # Add padding if necessary
-        num_padding = max_n_visits - current_n_visits
-        for _ in range(num_padding):
-            patient_visit_data.append(padding_visit_features)
-
-        # Stack the visit data for this patient: list of vectors -> 2D array
-        # Resulting shape: (max_n_visits, n_total_covs)
-        patient_matrix_visits_first = np.stack(patient_visit_data, axis=0)
-
-        # Transpose to get the desired shape: (n_total_covs, max_n_visits)
-        patient_matrix = patient_matrix_visits_first.T
-        all_patient_data.append(patient_matrix)
-
-    # --- 4. Stack patient matrices into the final 3D array ---
-    # Input: list of (n_total_covs, max_n_visits) arrays
-    # Output: shape (n_patients, n_total_covs, max_n_visits)
-    final_matrix = np.stack(all_patient_data, axis=0)
-
-    # Convert the final NumPy array to a JAX array
-    return jnp.asarray(final_matrix)
+                        j = drug_to_index[rxcui_str]
+                        X[i, num_static_covs + j, t] = 1.0
+                        
+    return jnp.asarray(X)
 
 def get_all_drugs(list_of_patients):
     """
@@ -533,7 +459,6 @@ def load_data(patient_start_idx=None, patient_end_idx=None):
             import pickle
             condition_list = pickle.load(f)
         
-        A = 2 * A - 1
         return A, X_cov, condition_list
     
     # Load a specific slice of patients if indices are provided
@@ -550,14 +475,38 @@ def load_data(patient_start_idx=None, patient_end_idx=None):
     # For consistency, we should load the full condition list, not just from the shard
     full_condition_list = get_all_conditions_from_drugs(load_patients_from_csv_files())
     
+    # Transform A matrix after all data loading and construction
+    A = 2 * A - 1
+
     # Cache the full dataset if it was loaded
     if patient_start_idx is None and patient_end_idx is None:
         if not os.path.exists('Data/cached'):
             os.makedirs('Data/cached')
-        np.savez(cache_file, A=A, X_cov=X_cov)
+        np.savez(cache_file, A=np.array(A), X_cov=np.array(X_cov))
         with open(condition_cache, 'wb') as f:
             import pickle
             pickle.dump(full_condition_list, f)
     
     return A, X_cov, full_condition_list
+
+
+if __name__ == '__main__':
+    import cProfile
+    import pstats
+    
+    # Profile the load_data function
+    profiler = cProfile.Profile()
+    profiler.enable()
+    
+    # Call the function to be profiled
+    A, X_cov, condition_list = load_data()
+    
+    profiler.disable()
+    
+    # Print the stats
+    stats = pstats.Stats(profiler).sort_stats('cumtime')
+    stats.print_stats(20)
+    
+    # Optionally, save the stats to a file
+    # stats.dump_stats('load_data_profile.prof')
 
