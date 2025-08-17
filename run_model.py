@@ -27,7 +27,7 @@ from datetime import datetime
 # Import Numpyro modules
 import numpyro
 import numpyro.distributions as dist
-from numpyro.infer import MCMC, NUTS, init_to_median
+from numpyro.infer import MCMC, NUTS, HMCECS, init_to_median
 from numpyro.infer.util import initialize_model
 
 # Import the required modules
@@ -130,17 +130,16 @@ def gmrf_model(L_rows, L_cols, y):
     # --- Define Priors ---
 
     # Patient/Row term with a more constrained Gaussian prior
-    J_v = numpyro.sample("J_v", dist.Normal(0.0, 0.1))
+    beta_pat = numpyro.sample("beta_pat", dist.Normal(0.0, 1.0))
 
     # Condition/Column term with a Horseshoe prior (non-centered parameterization)
     # Global shrinkage parameter (tau)
     tau = numpyro.sample("tau", dist.HalfCauchy(1.0))
     # Local shrinkage parameters (lambda_i)
     lambdas = numpyro.sample("lambdas", dist.HalfCauchy(1.0).expand([C]))
-    # Sample unscaled beta parameters from a standard Normal
-    beta_unscaled = numpyro.sample("beta_unscaled", dist.Normal(0.0, 1.0).expand([C]))
+    # Sample beta parameter for patients from a standard Normal
     # Scale them to get the final beta parameters
-    beta = numpyro.deterministic("beta", beta_unscaled * tau * lambdas)
+    beta_cond = numpyro.deterministic("beta_cond",  tau * lambdas)
 
     # Latent Field
     Lambda = numpyro.sample("Lambda", dist.Normal(0, 1.0).expand([I, C]))
@@ -155,11 +154,11 @@ def gmrf_model(L_rows, L_cols, y):
     # Vertical Energy (Row/Patient Interactions) - Governed by a single J_v
     # Use vmap to compute the quadratic form for each column of Lambda
     U_vertical_per_col = jax.vmap(sparse_quadratic_form, in_axes=(1, None), out_axes=0)(Lambda, L_rows)
-    U_vertical = J_v * jnp.sum(U_vertical_per_col)
+    U_vertical = beta_pat * jnp.sum(U_vertical_per_col)
     numpyro.factor("v_interact", -0.5 * U_vertical)
 
     # Horizontal Energy (Column/Condition Interactions) - Governed by per-condition betas
-    Lambda_scaled = Lambda * beta[None, :]  # Broadcasting beta across all patients
+    Lambda_scaled = Lambda * beta_cond[None, :]  # Broadcasting beta across all patients
     # Use vmap to compute the quadratic form for each row of Lambda_scaled
     U_horizontal_per_row = jax.vmap(sparse_quadratic_form, in_axes=(0, None), out_axes=0)(Lambda_scaled, L_cols)
     U_horizontal = jnp.sum(U_horizontal_per_row)
@@ -216,12 +215,12 @@ def run_gmrf_inference(data, args):
     # --- NumPyro Model Inference ---
     model = lambda: gmrf_model(L_rows, L_cols, binary_data)
     
-    nuts_kernel = NUTS(model, target_accept_prob=0.9)
+    kernel = HMCECS(model)
     
-    logging.info("Running MCMC for GMRF model...")
+    logging.info("Running MCMC for GMRF model with HMCECS kernel...")
     mcmc = MCMC(
-        nuts_kernel,
-        num_warmup=1000,
+        kernel,
+        num_warmup=10000,
         num_samples=args.pnum,
         num_chains=4,
         progress_bar=True,
