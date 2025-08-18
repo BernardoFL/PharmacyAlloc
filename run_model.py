@@ -132,9 +132,12 @@ def compute_neighbor_energy(Lambda, neighbor_table, beta_values=None):
         if len(neighbors) == 0:
             continue
             
+        # Convert neighbors list to JAX array for proper indexing
+        neighbors_array = jnp.array(neighbors)
+        
         # Get the latent values for current item and its neighbors
         item_latent = Lambda[item_idx]
-        neighbor_latents = Lambda[neighbors]
+        neighbor_latents = Lambda[neighbors_array]
         
         # Compute squared differences with neighbors
         if beta_values is not None:
