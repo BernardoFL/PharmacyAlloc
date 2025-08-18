@@ -147,7 +147,14 @@ def compute_neighbor_energy(Lambda, neighbor_table, beta_values=None):
             beta = 1.0
             
         # Sum of squared differences with all neighbors
-        squared_diffs = jnp.sum((item_latent - neighbor_latents) ** 2, axis=1)
+        # Handle both 1D and 2D cases - compute squared differences element-wise
+        if item_latent.ndim == 1:
+            # For 1D case (single row/column), compute squared differences directly
+            squared_diffs = (item_latent - neighbor_latents) ** 2
+        else:
+            # For 2D case, sum across the feature dimension
+            squared_diffs = jnp.sum((item_latent - neighbor_latents) ** 2, axis=1)
+        
         energy_contribution = beta * jnp.sum(squared_diffs)
         total_energy += energy_contribution
     
