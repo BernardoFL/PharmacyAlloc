@@ -117,7 +117,7 @@ def compute_neighbor_energy(Lambda, neighbor_table, beta_values=None):
     Lambda : jax.numpy.ndarray
         Latent field matrix of shape (n_items, n_features) or (n_features, n_items).
     neighbor_table : dict
-        Hash table mapping item indices to neighbor indices.
+        Hash table mapping item indices to pre-converted JAX arrays of neighbor indices.
     beta_values : jax.numpy.ndarray, optional
         Beta values for scaling interactions. If None, uses uniform scaling.
         
@@ -128,13 +128,10 @@ def compute_neighbor_energy(Lambda, neighbor_table, beta_values=None):
     """
     total_energy = 0.0
     
-    for item_idx, neighbors in neighbor_table.items():
-        if len(neighbors) == 0:
+    for item_idx, neighbors_array in neighbor_table.items():
+        if neighbors_array.shape[0] == 0:
             continue
             
-        # Convert neighbors list to JAX array for proper indexing
-        neighbors_array = jnp.array(neighbors)
-        
         # Get the latent values for current item and its neighbors
         item_latent = Lambda[item_idx]
         neighbor_latents = Lambda[neighbors_array]
@@ -249,8 +246,12 @@ def run_gmrf_inference(data, args):
     
     # 3. Subset neighbor tables to match the data batch
     logging.info(f"Subsetting neighbor tables for batch size: N={N}, C={C}")
-    patient_neighbors = {i: patient_neighbors_full[i] for i in range(N) if i in patient_neighbors_full}
-    condition_neighbors = {i: condition_neighbors_full[i] for i in range(C) if i in condition_neighbors_full}
+    patient_neighbors_list = {i: patient_neighbors_full[i] for i in range(N) if i in patient_neighbors_full}
+    condition_neighbors_list = {i: condition_neighbors_full[i] for i in range(C) if i in condition_neighbors_full}
+
+    # Pre-convert neighbor lists to JAX arrays for performance
+    patient_neighbors = {k: jnp.array(v) for k, v in patient_neighbors_list.items()}
+    condition_neighbors = {k: jnp.array(v) for k, v in condition_neighbors_list.items()}
 
     logging.info(f"Patient neighbor table size: {len(patient_neighbors)}")
     logging.info(f"Condition neighbor table size: {len(condition_neighbors)}")
@@ -264,9 +265,9 @@ def run_gmrf_inference(data, args):
     # --- NumPyro Model Inference ---
     model = lambda: gmrf_model_hash_tables(patient_neighbors, condition_neighbors, binary_data)
     
-    kernel = HMCECS(NUTS(model), num_blocks=10)
+    kernel = NUTS(model)
     
-    logging.info("Running MCMC for GMRF model with HMCECS kernel...")
+    logging.info("Running MCMC for GMRF model with NUTS kernel...")
     mcmc = MCMC(
         kernel,
         num_warmup=10000,
