@@ -108,16 +108,48 @@ def create_neighbor_hash_tables(knn_indices, max_neighbors=10):
     
     return neighbor_tables
 
-def compute_neighbor_energy(Lambda, neighbor_table, beta_values=None):
+def create_padded_neighbor_arrays(neighbor_lists, num_items, max_k=10):
     """
-    Compute the energy contribution from neighbor interactions using hash table lookup.
+    Creates padded, dense JAX arrays for neighbors and masks from a dictionary.
+    
+    Parameters
+    ----------
+    neighbor_lists : dict
+        Dictionary mapping item indices to lists of neighbors.
+    num_items : int
+        The total number of items (e.g., N patients or C conditions).
+    max_k : int
+        The maximum number of neighbors to pad to.
+        
+    Returns
+    -------
+    (jax.numpy.ndarray, jax.numpy.ndarray)
+        A tuple containing the padded neighbor array and the boolean mask array.
+    """
+    # Initialize padded array with -1 as a sentinel value
+    neighbors_padded = np.full((num_items, max_k), -1, dtype=np.int32)
+    neighbors_mask = np.zeros((num_items, max_k), dtype=bool)
+
+    for i, neighbors in neighbor_lists.items():
+        num_neighbors = len(neighbors)
+        if num_neighbors > 0:
+            neighbors_padded[i, :num_neighbors] = neighbors
+            neighbors_mask[i, :num_neighbors] = True
+            
+    return jnp.array(neighbors_padded), jnp.array(neighbors_mask)
+
+def compute_neighbor_energy_vectorized(Lambda, neighbors_padded, neighbors_mask, beta_values=None):
+    """
+    Computes the energy contribution from neighbor interactions in a fully vectorized manner.
     
     Parameters
     ----------
     Lambda : jax.numpy.ndarray
-        Latent field matrix of shape (n_items, n_features) or (n_features, n_items).
-    neighbor_table : dict
-        Hash table mapping item indices to pre-converted JAX arrays of neighbor indices.
+        Latent field vector of shape (num_items,).
+    neighbors_padded : jax.numpy.ndarray
+        Padded neighbor indices, shape (num_items, max_k).
+    neighbors_mask : jax.numpy.ndarray
+        Boolean mask for real neighbors, shape (num_items, max_k).
     beta_values : jax.numpy.ndarray, optional
         Beta values for scaling interactions. If None, uses uniform scaling.
         
@@ -126,92 +158,78 @@ def compute_neighbor_energy(Lambda, neighbor_table, beta_values=None):
     float
         Total energy contribution from neighbor interactions.
     """
-    total_energy = 0.0
+    # Get latent values for all items. Shape: (num_items, 1)
+    item_latents = Lambda[:, None]
     
-    for item_idx, neighbors_array in neighbor_table.items():
-        if neighbors_array.shape[0] == 0:
-            continue
-            
-        # Get the latent values for current item and its neighbors
-        item_latent = Lambda[item_idx]
-        neighbor_latents = Lambda[neighbors_array]
-        
-        # Compute squared differences with neighbors
-        if beta_values is not None:
-            # Use per-item beta values for scaling
-            beta = beta_values[item_idx] if item_idx < len(beta_values) else 1.0
-        else:
-            beta = 1.0
-            
-        # Sum of squared differences with all neighbors
-        # Handle both 1D and 2D cases by checking the dimensionality of the input Lambda
-        if Lambda.ndim == 1:
-            # For 1D case (single row/column), compute squared differences directly
-            squared_diffs = (item_latent - neighbor_latents) ** 2
-        else:
-            # For 2D case, sum across the feature dimension
-            squared_diffs = jnp.sum((item_latent - neighbor_latents) ** 2, axis=1)
-        
-        energy_contribution = beta * jnp.sum(squared_diffs)
-        total_energy += energy_contribution
-    
-    return total_energy
+    # Handle the padding index (-1). Replace with 0; the mask will negate its contribution.
+    valid_neighbors = jnp.where(neighbors_padded == -1, 0, neighbors_padded)
+    # Get latent values for all neighbors. Shape: (num_items, max_k)
+    neighbor_latents = Lambda[valid_neighbors]
 
-def gmrf_model_hash_tables(patient_neighbors, condition_neighbors, y):
+    # Compute squared differences. Shape: (num_items, max_k)
+    squared_diffs = (item_latents - neighbor_latents) ** 2
+    
+    # Apply mask to zero out padded neighbors
+    masked_diffs = squared_diffs * neighbors_mask
+    
+    # Sum over the neighbors dimension. Shape: (num_items,)
+    energy_per_item = jnp.sum(masked_diffs, axis=1)
+    
+    # Apply beta scaling if provided
+    if beta_values is not None:
+        scaled_energy_per_item = energy_per_item * beta_values
+    else:
+        scaled_energy_per_item = energy_per_item
+        
+    # Return the total sum
+    return jnp.sum(scaled_energy_per_item)
+
+def gmrf_model_vectorized(patient_padded, patient_mask, condition_padded, condition_mask, y):
     """
-    Gaussian Markov Random Field model using hash tables for O(n) neighbor computation.
+    Gaussian Markov Random Field model using fully vectorized neighbor computation.
     
     Parameters
     ----------
-    patient_neighbors : dict
-        Hash table mapping patient indices to neighbor indices (max 10 per patient).
-    condition_neighbors : dict
-        Hash table mapping condition indices to neighbor indices (max 10 per condition).
+    patient_padded : jax.numpy.ndarray
+        Padded neighbor indices for patients.
+    patient_mask : jax.numpy.ndarray
+        Boolean mask for patient neighbors.
+    condition_padded : jax.numpy.ndarray
+        Padded neighbor indices for conditions.
+    condition_mask : jax.numpy.ndarray
+        Boolean mask for condition neighbors.
     y : jax.numpy.ndarray
         Observed binary data matrix.
     """
     I, C = y.shape  # I = patients (rows), C = conditions (columns)
 
     # --- Define Priors ---
-
-    # Patient/Row term with a more constrained Gaussian prior
     beta_pat = numpyro.sample("beta_pat", dist.Normal(0.0, 1.0))
-
-    # Condition/Column term with a Horseshoe prior (non-centered parameterization)
-    # Global shrinkage parameter (tau)
     tau = numpyro.sample("tau", dist.HalfCauchy(1.0))
-    # Local shrinkage parameters (lambda_i)
     lambdas = numpyro.sample("lambdas", dist.HalfCauchy(1.0).expand([C]))
-    # Sample beta parameter for patients from a standard Normal
-    # Scale them to get the final beta parameters
     beta_cond = numpyro.deterministic("beta_cond",  tau * lambdas)
-
-    # Latent Field
     Lambda = numpyro.sample("Lambda", dist.Normal(0, 1.0).expand([I, C]))
 
-    # --- Impose GMRF Structure using Hash Tables ---
+    # --- Impose GMRF Structure using Vectorized Computation ---
     
-    # Vertical Energy (Row/Patient Interactions) - Governed by a single beta_pat
-    # Compute energy for each column of Lambda using patient neighbor tables
-    def vertical_energy_per_col(col_idx):
-        col_latent = Lambda[:, col_idx]
-        return compute_neighbor_energy(col_latent, patient_neighbors, None)
-    
-    # Use vmap to compute energy for all columns
-    U_vertical_per_col = jax.vmap(vertical_energy_per_col)(jnp.arange(C))
+    # Vertical Energy (Patient Interactions)
+    # vmap over columns of Lambda. `col_latent` has shape (I,).
+    def vertical_energy_per_col(col_latent):
+        return compute_neighbor_energy_vectorized(col_latent, patient_padded, patient_mask, None)
+
+    U_vertical_per_col = jax.vmap(vertical_energy_per_col, in_axes=1, out_axes=0)(Lambda)
     U_vertical = beta_pat * jnp.sum(U_vertical_per_col)
     numpyro.factor("v_interact", -0.5 * U_vertical)
 
-    # Horizontal Energy (Column/Condition Interactions) - Governed by per-condition betas
-    # Scale Lambda by condition betas
-    Lambda_scaled = Lambda * beta_cond[None, :]  # Broadcasting beta across all patients
+    # Horizontal Energy (Condition Interactions)
+    # Pre-scale Lambda by condition-specific betas
+    Lambda_scaled = Lambda * beta_cond[None, :]
     
-    def horizontal_energy_per_row(row_idx):
-        row_latent = Lambda_scaled[row_idx, :]
-        return compute_neighbor_energy(row_latent, condition_neighbors, None)
-    
-    # Use vmap to compute energy for all rows
-    U_horizontal_per_row = jax.vmap(horizontal_energy_per_row)(jnp.arange(I))
+    # vmap over rows of Lambda_scaled. `row_latent` has shape (C,).
+    def horizontal_energy_per_row(row_latent):
+        return compute_neighbor_energy_vectorized(row_latent, condition_padded, condition_mask, None)
+
+    U_horizontal_per_row = jax.vmap(horizontal_energy_per_row, in_axes=0, out_axes=0)(Lambda_scaled)
     U_horizontal = jnp.sum(U_horizontal_per_row)
     numpyro.factor("h_interact", -0.5 * U_horizontal)
 
@@ -254,21 +272,21 @@ def run_gmrf_inference(data, args):
     condition_neighbors_list = create_neighbor_hash_tables(condition_indices_subset, max_neighbors=10)
     del condition_indices_subset  # Free memory
 
-    # Pre-convert neighbor lists to JAX arrays for performance
-    patient_neighbors = {k: jnp.array(v) for k, v in patient_neighbors_list.items()}
-    condition_neighbors = {k: jnp.array(v) for k, v in condition_neighbors_list.items()}
+    # Pre-convert neighbor lists to padded JAX arrays for vectorization
+    patient_padded, patient_mask = create_padded_neighbor_arrays(patient_neighbors_list, N)
+    condition_padded, condition_mask = create_padded_neighbor_arrays(condition_neighbors_list, C)
 
-    logging.info(f"Patient neighbor table size: {len(patient_neighbors)}")
-    logging.info(f"Condition neighbor table size: {len(condition_neighbors)}")
+    logging.info(f"Patient padded array shape: {patient_padded.shape}")
+    logging.info(f"Condition padded array shape: {condition_padded.shape}")
     
     # Log some statistics about neighbor counts
-    patient_neighbor_counts = [len(neighbors) for neighbors in patient_neighbors.values()]
-    condition_neighbor_counts = [len(neighbors) for neighbors in condition_neighbors.values()]
-    logging.info(f"Patient neighbors per item - min: {min(patient_neighbor_counts)}, max: {max(patient_neighbor_counts)}, mean: {np.mean(patient_neighbor_counts):.2f}")
-    logging.info(f"Condition neighbors per item - min: {min(condition_neighbor_counts)}, max: {max(condition_neighbor_counts)}, mean: {np.mean(condition_neighbor_counts):.2f}")
+    patient_neighbor_counts = jnp.sum(patient_mask, axis=1)
+    condition_neighbor_counts = jnp.sum(condition_mask, axis=1)
+    logging.info(f"Patient neighbors per item - min: {jnp.min(patient_neighbor_counts)}, max: {jnp.max(patient_neighbor_counts)}, mean: {jnp.mean(patient_neighbor_counts):.2f}")
+    logging.info(f"Condition neighbors per item - min: {jnp.min(condition_neighbor_counts)}, max: {jnp.max(condition_neighbor_counts)}, mean: {jnp.mean(condition_neighbor_counts):.2f}")
 
     # --- NumPyro Model Inference ---
-    model = lambda: gmrf_model_hash_tables(patient_neighbors, condition_neighbors, binary_data)
+    model = lambda: gmrf_model_vectorized(patient_padded, patient_mask, condition_padded, condition_mask, binary_data)
     
     kernel = NUTS(model)
     
