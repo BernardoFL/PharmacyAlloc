@@ -239,15 +239,20 @@ def run_gmrf_inference(data, args):
     patient_knn = load_patient_knn(lazy_load=True)
     condition_knn = load_condition_knn(lazy_load=True)
 
-    # 2. Create neighbor hash tables with k ≤ 10 restriction
-    logging.info("Creating neighbor hash tables with k ≤ 10 restriction...")
-    patient_neighbors_full = create_neighbor_hash_tables(patient_knn['indices'], max_neighbors=10)
-    condition_neighbors_full = create_neighbor_hash_tables(condition_knn['indices'], max_neighbors=10)
+    # 2. Create neighbor hash tables from the required subset to save memory
+    logging.info("Creating neighbor hash tables for the data subset (k <= 10)...")
     
-    # 3. Subset neighbor tables to match the data batch
-    logging.info(f"Subsetting neighbor tables for batch size: N={N}, C={C}")
-    patient_neighbors_list = {i: patient_neighbors_full[i] for i in range(N) if i in patient_neighbors_full}
-    condition_neighbors_list = {i: condition_neighbors_full[i] for i in range(C) if i in condition_neighbors_full}
+    # Process patients: slice the required data, create the table, and then free memory
+    patient_indices_subset = patient_knn['indices'][:N]
+    del patient_knn  # Free memory
+    patient_neighbors_list = create_neighbor_hash_tables(patient_indices_subset, max_neighbors=10)
+    del patient_indices_subset  # Free memory
+    
+    # Process conditions: slice the required data, create the table, and then free memory
+    condition_indices_subset = condition_knn['indices'][:C]
+    del condition_knn  # Free memory
+    condition_neighbors_list = create_neighbor_hash_tables(condition_indices_subset, max_neighbors=10)
+    del condition_indices_subset  # Free memory
 
     # Pre-convert neighbor lists to JAX arrays for performance
     patient_neighbors = {k: jnp.array(v) for k, v in patient_neighbors_list.items()}
