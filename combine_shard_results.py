@@ -39,41 +39,128 @@ def setup_logging(log_dir: str = 'logs') -> str:
 
 
 def compute_wasserstein_barycenter(mcmc_samples, weights=None):
-    """Compute a Wasserstein (or Euclidean fallback) barycenter across shards.
+    """Compute an empirical Wasserstein barycenter across shards.
 
-    Accepts a list of arrays with identical shapes: (num_draws, ...).
-    If POT (ot) is unavailable, falls back to simple Euclidean mean across shards.
+    - For 1D parameters (after flattening), uses W2-quantile averaging (exact in 1D).
+    - For multi-D parameters, uses POT sliced Wasserstein barycenter when available.
+    - If POT is unavailable or an error occurs, falls back to weighted Euclidean mean across shards.
+
+    Returns (barycenter_samples, method_str).
     """
     n_distributions = len(mcmc_samples)
     if n_distributions == 0:
         raise ValueError("No sample arrays provided to compute barycenter.")
 
-    # Default uniform weights
+    # Default uniform weights over distributions
     if weights is None:
         weights = np.ones(n_distributions, dtype=float) / float(n_distributions)
 
-    # If POT isn't installed, fall back to simple (weighted) Euclidean mean
-    if ot is None:
+    # Normalize shapes and detect dimensionality
+    flat_samples = [arr.reshape(arr.shape[0], -1) for arr in mcmc_samples]
+    dims = [fs.shape[1] for fs in flat_samples]
+    if not all(d == dims[0] for d in dims):
+        raise ValueError("All sample arrays must have the same flattened dimensionality.")
+    dim = dims[0]
+
+    # Utility: weighted Euclidean mean across shards (returns same shape as samples)
+    def euclidean_mean() -> tuple:
         stacked = np.stack(mcmc_samples, axis=0)  # (S, num_draws, ...)
-        # Broadcast weights to leading dimension
         w = np.array(weights, dtype=float).reshape(-1, *([1] * (stacked.ndim - 1)))
-        return np.sum(w * stacked, axis=0)
+        return np.sum(w * stacked, axis=0), 'euclidean_mean_fallback'
 
-    # POT barycenter in flattened space
-    all_samples = []
-    all_weights = []
-    for samples in mcmc_samples:
-        flat_samples = samples.reshape(len(samples), -1)
-        sample_weights = np.ones(len(samples)) / len(samples)
-        all_samples.append(flat_samples)
-        all_weights.append(sample_weights)
+    # 1D exact barycenter via quantile averaging
+    if dim == 1:
+        try:
+            # Choose common number of support points K
+            num_points_per = [fs.shape[0] for fs in flat_samples]
+            K = int(np.min(num_points_per))
+            if K <= 0:
+                return euclidean_mean()
 
-    barycenter = ot.lp.free_support_barycenter(all_samples, all_weights, weights)
+            # Uniform quantile grid
+            qs = np.linspace(0.0, 1.0, K, endpoint=False) + 0.5 / K
 
-    original_shape = mcmc_samples[0].shape
-    if len(original_shape) > 2:
-        barycenter = barycenter.reshape(-1, *original_shape[1:])
-    return barycenter
+            # For each distribution, compute quantiles via sorting and interpolation
+            quantiles = []
+            for fs in flat_samples:
+                xs = np.sort(fs[:, 0])  # (n,)
+                # Empirical CDF inverse at qs using linear interpolation between order stats
+                ranks = qs * (len(xs) - 1)
+                lo = np.floor(ranks).astype(int)
+                hi = np.ceil(ranks).astype(int)
+                frac = ranks - lo
+                q = (1 - frac) * xs[lo] + frac * xs[hi]
+                quantiles.append(q)
+
+            quantiles = np.stack(quantiles, axis=0)  # (S, K)
+            w = np.array(weights, dtype=float).reshape(-1, 1)
+            bary_1d = np.sum(w * quantiles, axis=0).reshape(K, 1)
+
+            # Reshape back to original trailing shape if needed
+            original_shape = mcmc_samples[0].shape
+            if len(original_shape) > 2:
+                bary_1d = bary_1d.reshape(-1, *original_shape[1:])
+            return bary_1d, 'wasserstein_barycenter_1d'
+        except Exception:
+            logging.exception("1D barycenter failed; using Euclidean mean fallback.")
+            return euclidean_mean()
+
+    # Multi-D sliced Wasserstein barycenter using POT
+    if ot is None:
+        return euclidean_mean()
+
+    try:
+        # Common number of support points for barycenter
+        num_points_per = [fs.shape[0] for fs in flat_samples]
+        K = int(np.min(num_points_per))
+        if K <= 0:
+            return euclidean_mean()
+
+        # Optionally subsample each distribution to K points (without replacement)
+        rng = np.random.default_rng(123)
+        Xs = []
+        for fs in flat_samples:
+            n = fs.shape[0]
+            if n == K:
+                Xs.append(fs)
+            elif n > K:
+                idx = rng.choice(n, size=K, replace=False)
+                Xs.append(fs[idx])
+            else:
+                # if fewer, resample with replacement to K
+                idx = rng.choice(n, size=K, replace=True)
+                Xs.append(fs[idx])
+
+        # Initialize barycenter support with first distribution
+        X_init = Xs[0].copy()
+
+        # Try sliced barycenter API
+        if hasattr(ot, 'sliced') and hasattr(ot.sliced, 'sliced_wasserstein_barycenter'):
+            Xb = ot.sliced.sliced_wasserstein_barycenter(Xs, np.asarray(weights, dtype=float), X_init, n_projections=128)
+            bary = np.asarray(Xb, dtype=float)
+            original_shape = mcmc_samples[0].shape
+            if len(original_shape) > 2:
+                bary = bary.reshape(-1, *original_shape[1:])
+            return bary, 'sliced_wasserstein_barycenter'
+
+        # Fallback: free-support barycenter if available
+        if hasattr(ot, 'lp') and hasattr(ot.lp, 'free_support_barycenter'):
+            # Uniform weights over support points
+            point_weights = [np.ones(x.shape[0], dtype=float) / float(x.shape[0]) for x in Xs]
+            # Provide initial support and barycenter weights (uniform)
+            b_init = np.ones(K, dtype=float) / float(K)
+            Xb = ot.lp.free_support_barycenter(Xs, point_weights, np.asarray(weights, dtype=float), X_init=X_init, b=b_init)
+            bary = np.asarray(Xb, dtype=float)
+            original_shape = mcmc_samples[0].shape
+            if len(original_shape) > 2:
+                bary = bary.reshape(-1, *original_shape[1:])
+            return bary, 'free_support_wasserstein_barycenter'
+
+        # If no suitable POT API, fall back
+        return euclidean_mean()
+    except Exception:
+        logging.exception("Multi-D barycenter failed; using Euclidean mean fallback.")
+        return euclidean_mean()
 
 
 def load_shard_samples(shard_dir: str):
@@ -127,13 +214,17 @@ def combine_from_dirs(shard_dirs):
     keys_to_process += [k for k in candidate_keys if k not in keys_to_process]
 
     # Combine selected keys
+    per_key_method = {}
     for key in keys_to_process:
         try:
-            combined[key] = compute_wasserstein_barycenter([s[key] for s in all_samples])
+            bary, method = compute_wasserstein_barycenter([s[key] for s in all_samples])
+            combined[key] = bary
+            per_key_method[key] = method
         except Exception as exc:
             logging.warning(f"Failed barycenter for key '{key}' ({exc}); using simple mean.")
             stacked = np.stack([s[key] for s in all_samples], axis=0)
             combined[key] = np.mean(stacked, axis=0)
+            per_key_method[key] = 'euclidean_mean_fallback'
 
     # If we have latent field, compute probabilities
     latent_key = 'f' if 'f' in combined else ('Lambda' if 'Lambda' in combined else None)
@@ -144,7 +235,10 @@ def combine_from_dirs(shard_dirs):
     # Metadata
     combined['num_shards'] = len(shard_dirs)
     combined['shard_results_dirs'] = shard_dirs
-    combined['combination_method'] = 'wasserstein_barycenter' if ot is not None else 'euclidean_mean_fallback'
+    # Record method at both global and per-key levels
+    any_wasserstein = any(m.startswith('wasserstein') or 'barycenter' in m for m in per_key_method.values())
+    combined['combination_method'] = 'wasserstein' if any_wasserstein else 'euclidean_mean_fallback'
+    combined['combination_method_by_key'] = per_key_method
     combined['total_samples'] = _first_available_draw_count(all_samples[0]) * len(shard_dirs)
     return combined
 
