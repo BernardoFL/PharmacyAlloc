@@ -210,12 +210,16 @@ def combine_from_dirs(shard_dirs):
 
     combined = {}
 
-    # Decide which keys to combine: only allowlist and present in ALL shards
+    # Decide which keys to combine: allowlist, present in at least one shard
     allowlist = {'beta_cond', 'beta_pat', 'lambdas', 'tau'}
-    common_keys = set(all_samples[0].keys())
-    for s in all_samples[1:]:
-        common_keys &= set(s.keys())
-    candidate_keys = [k for k in common_keys if k in allowlist and isinstance(all_samples[0][k], np.ndarray)]
+    union_keys = set()
+    for s in all_samples:
+        union_keys |= set(s.keys())
+    candidate_keys = []
+    for k in allowlist:
+        present_arrays = [isinstance(s.get(k, None), np.ndarray) for s in all_samples]
+        if any(present_arrays):
+            candidate_keys.append(k)
     # Preserve stable ordering
     ordered = ['beta_cond', 'beta_pat', 'lambdas', 'tau']
     keys_to_process = [k for k in ordered if k in candidate_keys]
@@ -224,7 +228,8 @@ def combine_from_dirs(shard_dirs):
     per_key_method = {}
     for key in keys_to_process:
         try:
-            arrays = [s[key] for s in all_samples]
+            # Use only shards that have this key
+            arrays = [s[key] for s in all_samples if key in s]
 
             # Align number of draws by trimming to min draws
             min_draws = int(min(a.shape[0] for a in arrays))
