@@ -172,7 +172,7 @@ def save_combined_results(combined_samples, args, failed_shards=None):
         f.write("=" * 40 + "\n\n")
         f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Total shards: {combined_samples['num_shards']}\n")
-        f.write(f"Combination method: Wasserstein barycenter\n")
+        f.write(f"Combination method: {combined_samples.get('combination_method', 'unknown')}\n")
         f.write("Keys in combined samples:\n")
         for k, v in combined_samples.items():
             if isinstance(v, np.ndarray):
