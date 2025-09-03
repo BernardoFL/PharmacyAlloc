@@ -217,13 +217,33 @@ def combine_from_dirs(shard_dirs):
     per_key_method = {}
     for key in keys_to_process:
         try:
-            bary, method = compute_wasserstein_barycenter([s[key] for s in all_samples])
+            # Ensure arrays are compatible: same flattened dimensionality
+            arrays = [s[key] for s in all_samples]
+            flat_dims = [a.reshape(a.shape[0], -1).shape[1] for a in arrays]
+            if not all(d == flat_dims[0] for d in flat_dims):
+                raise ValueError("All sample arrays must have the same flattened dimensionality.")
+
+            # Align number of draws by trimming to min draws
+            min_draws = int(min(a.shape[0] for a in arrays))
+            arrays = [a[:min_draws] for a in arrays]
+
+            bary, method = compute_wasserstein_barycenter(arrays)
             combined[key] = bary
             per_key_method[key] = method
         except Exception as exc:
             logging.warning(f"Failed barycenter for key '{key}' ({exc}); using simple mean.")
-            stacked = np.stack([s[key] for s in all_samples], axis=0)
-            combined[key] = np.mean(stacked, axis=0)
+            try:
+                arrays = [s[key] for s in all_samples]
+                # Try mean after aligning shapes if possible
+                flat_dims = [a.reshape(a.shape[0], -1).shape[1] for a in arrays]
+                if all(d == flat_dims[0] for d in flat_dims):
+                    min_draws = int(min(a.shape[0] for a in arrays))
+                    arrays = [a[:min_draws] for a in arrays]
+                stacked = np.stack(arrays, axis=0)
+                combined[key] = np.mean(stacked, axis=0)
+            except Exception:
+                logging.exception(f"Simple mean also failed for key '{key}'. Skipping this key.")
+                continue
             per_key_method[key] = 'euclidean_mean_fallback'
 
     # If we have latent field, compute probabilities
