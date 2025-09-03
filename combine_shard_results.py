@@ -200,34 +200,47 @@ def combine_from_dirs(shard_dirs):
 
     combined = {}
 
-    # Decide which keys to combine: intersection of ndarray-valued keys across shards
+    # Decide which keys to combine: only allowlist and present in ALL shards
+    allowlist = {'beta_cond', 'beta_pat', 'lambdas', 'tau'}
     common_keys = set(all_samples[0].keys())
     for s in all_samples[1:]:
         common_keys &= set(s.keys())
-    # Exclude non-array/meta keys
-    candidate_keys = [k for k in common_keys if isinstance(all_samples[0][k], np.ndarray)]
-
-    # Prioritize known hyper/latent keys if present
-    prioritized = ['eta', 'ell', 'sigma_noise', 'beta_pat', 'tau', 'lambdas', 'f', 'Lambda']
-    keys_to_process = [k for k in prioritized if k in candidate_keys]
-    # Include any remaining array keys not yet processed
-    keys_to_process += [k for k in candidate_keys if k not in keys_to_process]
+    candidate_keys = [k for k in common_keys if k in allowlist and isinstance(all_samples[0][k], np.ndarray)]
+    # Preserve stable ordering
+    ordered = ['beta_cond', 'beta_pat', 'lambdas', 'tau']
+    keys_to_process = [k for k in ordered if k in candidate_keys]
 
     # Combine selected keys
     per_key_method = {}
     for key in keys_to_process:
         try:
-            # Ensure arrays are compatible: same flattened dimensionality
             arrays = [s[key] for s in all_samples]
-            flat_dims = [a.reshape(a.shape[0], -1).shape[1] for a in arrays]
-            if not all(d == flat_dims[0] for d in flat_dims):
-                raise ValueError("All sample arrays must have the same flattened dimensionality.")
 
             # Align number of draws by trimming to min draws
             min_draws = int(min(a.shape[0] for a in arrays))
             arrays = [a[:min_draws] for a in arrays]
 
-            bary, method = compute_wasserstein_barycenter(arrays)
+            # Handle vector parameters with per-coordinate 1D barycenters
+            if arrays[0].ndim == 2 and arrays[0].shape[1] > 1:
+                # Align vector length by trimming to min length across shards
+                min_len = int(min(a.shape[1] for a in arrays))
+                arrays = [a[:, :min_len] for a in arrays]
+
+                # Compute per-coordinate barycenter independently
+                cols = []
+                methods = []
+                for j in range(min_len):
+                    one_d_arrays = [a[:, j] for a in arrays]
+                    b_j, m_j = compute_wasserstein_barycenter([x.reshape(-1, 1) for x in one_d_arrays])
+                    # b_j has shape (K,1); squeeze to (K,)
+                    cols.append(b_j.reshape(-1))
+                    methods.append(m_j)
+                bary = np.stack(cols, axis=1)
+                # Use 1d tag if all 1d
+                method = 'per_coordinate_wasserstein_1d' if all(m.startswith('wasserstein') for m in methods) else 'per_coordinate_mixed'
+            else:
+                # Scalar case
+                bary, method = compute_wasserstein_barycenter(arrays)
             combined[key] = bary
             per_key_method[key] = method
         except Exception as exc:
