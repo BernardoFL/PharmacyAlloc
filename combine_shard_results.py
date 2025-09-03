@@ -184,6 +184,16 @@ def load_shard_samples(shard_dir: str):
         total_draws = samples['f'].shape[0]
         samples['f_reshaped'] = samples['f'].reshape(total_draws, N, C)
 
+    # Reconstruct beta_cond if absent but tau and lambdas are present
+    if 'beta_cond' not in samples and ('tau' in samples and 'lambdas' in samples):
+        try:
+            tau = samples['tau'].reshape(-1, 1)
+            lambdas = samples['lambdas']
+            if tau.shape[0] == lambdas.shape[0]:
+                samples['beta_cond'] = tau * lambdas
+        except Exception:
+            logging.warning(f"Failed to reconstruct beta_cond in {shard_dir}")
+
     return samples
 
 
@@ -222,19 +232,42 @@ def combine_from_dirs(shard_dirs):
 
             # Handle vector parameters with per-coordinate 1D barycenters
             if arrays[0].ndim == 2 and arrays[0].shape[1] > 1:
-                # Align vector length by trimming to min length across shards
-                min_len = int(min(a.shape[1] for a in arrays))
-                arrays = [a[:, :min_len] for a in arrays]
+                # Align vector length by padding/trimming to common length
+                lengths = [a.shape[1] for a in arrays]
+                max_len = int(max(lengths))
+                # Pad with NaNs to max_len so we can barycenter only over valid indices
+                padded = []
+                for a in arrays:
+                    if a.shape[1] == max_len:
+                        padded.append(a)
+                    elif a.shape[1] < max_len:
+                        pad = np.full((a.shape[0], max_len - a.shape[1]), np.nan, dtype=a.dtype)
+                        padded.append(np.concatenate([a, pad], axis=1))
+                    else:
+                        padded.append(a[:, :max_len])
+                arrays = padded
 
                 # Compute per-coordinate barycenter independently
                 cols = []
                 methods = []
-                for j in range(min_len):
-                    one_d_arrays = [a[:, j] for a in arrays]
+                for j in range(max_len):
+                    # Select shards that have a valid value at this coordinate (non-NaN)
+                    one_d_arrays = []
+                    for a in arrays:
+                        col = a[:, j]
+                        if not np.isnan(col).all():
+                            one_d_arrays.append(col[~np.isnan(col)])
+                    if len(one_d_arrays) == 0:
+                        continue
+                    # Align draws for this coordinate
+                    k = min(map(len, one_d_arrays))
+                    one_d_arrays = [x[:k] for x in one_d_arrays]
                     b_j, m_j = compute_wasserstein_barycenter([x.reshape(-1, 1) for x in one_d_arrays])
                     # b_j has shape (K,1); squeeze to (K,)
                     cols.append(b_j.reshape(-1))
                     methods.append(m_j)
+                if len(cols) == 0:
+                    raise ValueError("No valid coordinates to combine.")
                 bary = np.stack(cols, axis=1)
                 # Use 1d tag if all 1d
                 method = 'per_coordinate_wasserstein_1d' if all(m.startswith('wasserstein') for m in methods) else 'per_coordinate_mixed'
