@@ -14,16 +14,7 @@ import jax
 import jax.numpy as jnp
 from jax import random
 from _dependency.ising_jax import IsingJAX
-
-import sys
-import os
-sys.path.append(os.path.abspath(os.path.join(os.getcwd(), '.')))
-
-
-
-
-
-
+from _dependency.ising import Ising
 
 #==========================================================================
 # Define: Anisotropic 2D Ising Model

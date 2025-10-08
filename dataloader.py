@@ -4,6 +4,7 @@ import pandas as pd
 from typing import List, Dict, Any, Tuple
 import os
 import numpy as np
+import networkx as nx
 
 class Drug:
     """
@@ -295,7 +296,7 @@ def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_fil
     
     return patients
 
-def construct_A_matrix(patients: List[Patient]) -> Tuple[jnp.ndarray, Dict[str, int]]:
+def construct_A_matrix(patients: List[Patient], global_condition_map: Dict[str, int] = None) -> Tuple[jnp.ndarray, Dict[str, int]]:
     """
     Constructs a 3D JAX array A such that:
       A[i, j, t] == 1 if, at visit t, patient i takes condition j,
@@ -303,6 +304,8 @@ def construct_A_matrix(patients: List[Patient]) -> Tuple[jnp.ndarray, Dict[str, 
       
     A patient is considered to take condition j at a visit if one of the drugs they take
     in that visit has a Conditions list of length 1 and that single element equals j.
+    If global_condition_map is provided, it is used to define the columns. Otherwise, a map
+    is created from the conditions present in the provided patients.
     """
     # Create a long-form DataFrame of patient, visit, and drug data
     records = []
@@ -315,15 +318,25 @@ def construct_A_matrix(patients: List[Patient]) -> Tuple[jnp.ndarray, Dict[str, 
     if not records:
         # Handle the case where there are no valid drug conditions
         T_max = max(len(p.visits) for p in patients) if patients else 0
-        return jnp.zeros((len(patients), 0, T_max), dtype=jnp.int32), {}
+        num_conditions = len(global_condition_map) if global_condition_map else 0
+        return jnp.zeros((len(patients), num_conditions, T_max), dtype=jnp.int32), (global_condition_map if global_condition_map else {})
 
     df = pd.DataFrame(records, columns=['patient_idx', 'visit_idx', 'condition'])
     
     # Get unique conditions and create a mapping to indices
-    unique_conditions = sorted(df['condition'].unique())
-    condition_to_index = {cond: j for j, cond in enumerate(unique_conditions)}
+    if global_condition_map:
+        condition_to_index = global_condition_map
+        unique_conditions = sorted(global_condition_map.keys())
+    else:
+        unique_conditions = sorted(df['condition'].unique())
+        condition_to_index = {cond: j for j, cond in enumerate(unique_conditions)}
+        
     df['condition_idx'] = df['condition'].map(condition_to_index)
-    
+
+    # Drop rows where the condition is not in our map (can happen if using a global map on a subset of patients)
+    df.dropna(subset=['condition_idx'], inplace=True)
+    df['condition_idx'] = df['condition_idx'].astype(int)
+
     # Get dimensions for the final matrix
     N = len(patients)
     num_conditions = len(unique_conditions)
@@ -449,19 +462,32 @@ def load_data(patient_start_idx=None, patient_end_idx=None):
     cache_file = 'Data/cached/preprocessed_data.npz'
     condition_cache = 'Data/cached/condition_list.pkl'
     
-    # Only use cache if no specific patient range is requested
-    if patient_start_idx is None and patient_end_idx is None and os.path.exists(cache_file) and os.path.exists(condition_cache):
+    # Step 1: Ensure full condition list is available from cache or by loading all patients
+    if os.path.exists(condition_cache):
+        with open(condition_cache, 'rb') as f:
+            import pickle
+            full_condition_list = pickle.load(f)
+    else:
+        # Generate and cache the full condition list if not found
+        full_patients = load_patients_from_csv_files()
+        full_condition_list = get_all_conditions_from_drugs(full_patients)
+        if not os.path.exists('Data/cached'):
+            os.makedirs('Data/cached')
+        with open(condition_cache, 'wb') as f:
+            import pickle
+            pickle.dump(full_condition_list, f)
+
+    # Step 2: Create global condition map from the full list
+    global_condition_map = {cond.name: i for i, cond in enumerate(full_condition_list)}
+
+    # Step 3: Handle full data caching (only if no shard is specified)
+    if patient_start_idx is None and patient_end_idx is None and os.path.exists(cache_file):
         cached_data = np.load(cache_file)
         A = jnp.array(cached_data['A'])
         X_cov = jnp.array(cached_data['X_cov'])
-        
-        with open(condition_cache, 'rb') as f:
-            import pickle
-            condition_list = pickle.load(f)
-        
-        return A, X_cov, condition_list
+        return A, X_cov, full_condition_list
     
-    # Load a specific slice of patients if indices are provided
+    # Step 4: Load patient data (full or shard)
     patients = load_patients_from_csv_files(start_idx=patient_start_idx, end_idx=patient_end_idx)
     
     for patient in patients:
@@ -469,23 +495,18 @@ def load_data(patient_start_idx=None, patient_end_idx=None):
             visit["drugs"] = [drug for drug in visit["drugs"] 
                             if hasattr(drug, "atcs") and drug.atcs is not None and len(drug.atcs) > 0]
 
-    A, condition_to_index = construct_A_matrix(patients)
+    # Step 5: Construct matrices using the global map to ensure consistent dimensions
+    A, _ = construct_A_matrix(patients, global_condition_map=global_condition_map)
     X_cov = construct_covariate_matrix(patients)
-    
-    # For consistency, we should load the full condition list, not just from the shard
-    full_condition_list = get_all_conditions_from_drugs(load_patients_from_csv_files())
     
     # Transform A matrix after all data loading and construction
     A = 2 * A - 1
 
-    # Cache the full dataset if it was loaded
+    # Step 6: Cache the full dataset if it was loaded from scratch
     if patient_start_idx is None and patient_end_idx is None:
         if not os.path.exists('Data/cached'):
             os.makedirs('Data/cached')
         np.savez(cache_file, A=np.array(A), X_cov=np.array(X_cov))
-        with open(condition_cache, 'wb') as f:
-            import pickle
-            pickle.dump(full_condition_list, f)
     
     return A, X_cov, full_condition_list
 
