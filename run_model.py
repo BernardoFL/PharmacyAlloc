@@ -92,10 +92,10 @@ def bym_model(L_pat, y):
     # --- Define Hyper-priors ---
     
     # Precision for the structured spatial component (ICAR)
-    tau_s = numpyro.sample("tau_s", dist.HalfCauchy(1.0))
+    tau_s = numpyro.sample("tau_s", dist.HalfCauchy(2.0))
     
     # Precision for the unstructured component (i.i.d. noise)
-    tau_u = numpyro.sample("tau_u", dist.HalfCauchy(1.0))
+    tau_u = numpyro.sample("tau_u", dist.HalfCauchy(2.0))
     
     # Simple column effects for each condition
     sigma_delta = numpyro.sample("sigma_delta", dist.HalfCauchy(1.0))
