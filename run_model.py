@@ -78,7 +78,7 @@ def setup_logging(log_dir='logs'):
 
 def bym_model(L_pat, y):
     """
-    Besag, York, Mollié (BYM) model for spatial smoothing.
+    Besag, York, Mollié (BYM) model for spatial smoothing with correlated delta effects.
     
     Parameters
     ----------
@@ -97,9 +97,15 @@ def bym_model(L_pat, y):
     # Precision for the unstructured component (i.i.d. noise)
     tau_u = numpyro.sample("tau_u", dist.HalfCauchy(2.0))
     
-    # Simple column effects for each condition
-    sigma_delta = numpyro.sample("sigma_delta", dist.HalfCauchy(1.0))
-    delta = numpyro.sample("delta", dist.Normal(0, sigma_delta).expand([C]))
+    # Hyperprior for delta covariance matrix
+    # Use LKJ prior for correlation matrix and separate scale parameters
+    sigma_delta_scale = numpyro.sample("sigma_delta_scale", dist.HalfCauchy(1.0))
+    delta_corr = numpyro.sample("delta_corr", dist.LKJCholesky(C, concentration=1.0))
+    
+    # Construct covariance matrix: Sigma = diag(sigma_delta_scale) * R * diag(sigma_delta_scale)
+    # where R is the correlation matrix from LKJ
+    sigma_delta_vec = numpyro.sample("sigma_delta_vec", dist.HalfCauchy(1.0).expand([C]))
+    delta_cov = jnp.outer(sigma_delta_vec, sigma_delta_vec) * delta_corr
 
     # --- Define Latent Patient Field phi using BYM factor approach ---
     
@@ -115,6 +121,11 @@ def bym_model(L_pat, y):
     # This corresponds to the prior: phi_unstructured ~ N(0, (tau_u * I)^-1)
     U_unstructured = tau_u * jnp.sum(phi**2)
     numpyro.factor("unstructured_effect", -0.5 * U_unstructured)
+
+    # --- Correlated Delta Effects ---
+    
+    # Sample delta from multivariate normal with covariance structure
+    delta = numpyro.sample("delta", dist.MultivariateNormal(jnp.zeros(C), delta_cov))
 
     # --- Construct Final Latent Field Lambda ---
     
