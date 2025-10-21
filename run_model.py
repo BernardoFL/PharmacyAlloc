@@ -102,11 +102,11 @@ def bym_model(L_pat, y):
     sigma_delta_scale = numpyro.sample("sigma_delta_scale", dist.HalfCauchy(1.0))
     delta_corr = numpyro.sample("delta_corr", dist.LKJCholesky(C, concentration=100.0))
     
-    # Construct covariance matrix: Sigma = diag(sigma_delta_scale) * R * diag(sigma_delta_scale)
-    # where R is the correlation matrix from LKJ
+    # Construct covariance matrix using NumPyro deterministic operations
     sigma_delta_vec = numpyro.sample("sigma_delta_vec", dist.InverseGamma(1.0, 1.0).expand([C]))
-    # Convert Cholesky factor to correlation matrix
-    delta_corr_matrix = delta_corr @ delta_corr.T
+    
+    # Convert Cholesky factor to correlation matrix using NumPyro deterministic
+    delta_corr_matrix = numpyro.deterministic("delta_corr_matrix", delta_corr @ delta_corr.T)
     delta_cov = numpyro.deterministic("delta_cov", jnp.outer(sigma_delta_vec, sigma_delta_vec) * delta_corr_matrix)
 
     # --- Define Latent Patient Field phi using BYM factor approach ---
@@ -114,14 +114,14 @@ def bym_model(L_pat, y):
     # Base distribution for the patient field phi
     phi = numpyro.sample("phi", dist.Normal(0, 1.0).expand([I]))
 
-    # Add structured energy (ICAR component)
+    # Add structured energy (ICAR component) using NumPyro deterministic
     # This corresponds to the prior: phi_structured ~ N(0, (tau_s * L_pat)^-1)
-    U_structured = tau_s * (phi.T @ L_pat @ phi)
+    U_structured = numpyro.deterministic("U_structured", tau_s * (phi.T @ L_pat @ phi))
     numpyro.factor("structured_effect", -0.5 * U_structured)
 
-    # Add unstructured energy (i.i.d. component)
+    # Add unstructured energy (i.i.d. component) using NumPyro deterministic
     # This corresponds to the prior: phi_unstructured ~ N(0, (tau_u * I)^-1)
-    U_unstructured = tau_u * jnp.sum(phi**2)
+    U_unstructured = numpyro.deterministic("U_unstructured", tau_u * jnp.sum(phi**2))
     numpyro.factor("unstructured_effect", -0.5 * U_unstructured)
 
     # --- Correlated Delta Effects ---
@@ -131,8 +131,8 @@ def bym_model(L_pat, y):
 
     # --- Construct Final Latent Field Lambda ---
     
-    # Combine patient and column effects
-    Lambda = phi[:, None] + delta[None, :]
+    # Combine patient and column effects using NumPyro deterministic
+    Lambda = numpyro.deterministic("Lambda", phi[:, None] + delta[None, :])
 
     # --- Likelihood ---
     
