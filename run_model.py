@@ -100,12 +100,14 @@ def bym_model(L_pat, y):
     # Hyperprior for delta covariance matrix
     # Use LKJ prior for correlation matrix and separate scale parameters
     sigma_delta_scale = numpyro.sample("sigma_delta_scale", dist.HalfCauchy(1.0))
-    delta_corr = numpyro.sample("delta_corr", dist.LKJCholesky(C, concentration=1.0))
+    delta_corr = numpyro.sample("delta_corr", dist.LKJCholesky(C, concentration=100.0))
     
     # Construct covariance matrix: Sigma = diag(sigma_delta_scale) * R * diag(sigma_delta_scale)
     # where R is the correlation matrix from LKJ
-    sigma_delta_vec = numpyro.sample("sigma_delta_vec", dist.HalfCauchy(1.0).expand([C]))
-    delta_cov = jnp.outer(sigma_delta_vec, sigma_delta_vec) * delta_corr
+    sigma_delta_vec = numpyro.sample("sigma_delta_vec", dist.InverseGamma(1.0, 1.0).expand([C]))
+    # Convert Cholesky factor to correlation matrix
+    delta_corr_matrix = delta_corr @ delta_corr.T
+    delta_cov = numpyro.deterministic("delta_cov", jnp.outer(sigma_delta_vec, sigma_delta_vec) * delta_corr_matrix)
 
     # --- Define Latent Patient Field phi using BYM factor approach ---
     
@@ -184,7 +186,7 @@ def run_bym_inference(data, args):
     logging.info("Running MCMC for BYM model with NUTS kernel...")
     mcmc = MCMC(
         kernel,
-        num_warmup=10000,
+        num_warmup=20000,
         num_samples=args.pnum,
         num_chains=4,
         progress_bar=True,
