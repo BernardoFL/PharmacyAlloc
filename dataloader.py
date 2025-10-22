@@ -178,7 +178,7 @@ class Patient:
 
 
 
-def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_file="Data/drug_mapping_table.csv", drug_condition_file="Data/drug_condition_atc_table.csv", start_idx=None, end_idx=None):
+def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_file="Data/drug_mapping_table.csv", drug_condition_file="Data/drug_condition_atc_table.csv", start_idx=None, end_idx=None, min_visits: int = 1):
     """
     Constructs a list of Patient objects from three CSV files.
     If start_idx and end_idx are specified, only patients within that range are loaded.
@@ -290,9 +290,11 @@ def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_fil
                 "drugs": drugs
             }
             visits.append(visit)
-        # Create a Patient object with the list of Condition objects.
-        patient_obj = Patient(person_id=person_id, visits=visits, conditions=list(patient_conditions_dict.values()))
-        patients.append(patient_obj)
+        # Only include patients meeting the minimum number of visits
+        if len(visits) >= max(1, int(min_visits)):
+            # Create a Patient object with the list of Condition objects.
+            patient_obj = Patient(person_id=person_id, visits=visits, conditions=list(patient_conditions_dict.values()))
+            patients.append(patient_obj)
     
     return patients
 
@@ -454,7 +456,7 @@ def get_all_conditions_from_drugs(patients):
 # Example usage:
 # conditions = get_all_conditions_from_drugs(patients)
 # print("Conditions from drugs:", conditions)
-def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bool = False):
+def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bool = False, min_visits: int = 1):
     """
     Load and preprocess data, returning JAX arrays.
     Uses cached data if available and no specific patient range is requested.
@@ -482,7 +484,7 @@ def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bo
     global_condition_map = {cond.name: i for i, cond in enumerate(full_condition_list)}
 
     # Step 3: Handle full data caching (only if no shard is specified)
-    if patient_start_idx is None and patient_end_idx is None and os.path.exists(cache_file):
+    if min_visits == 1 and patient_start_idx is None and patient_end_idx is None and os.path.exists(cache_file):
         cached_data = np.load(cache_file)
         A = jnp.array(cached_data['A'])
         X_cov = jnp.array(cached_data['X_cov'])
@@ -494,7 +496,7 @@ def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bo
                 return A, X_cov, full_condition_list, visit_mask, visit_times
             else:
                 # Recompute visit metadata from source CSVs to match cached dataset
-                patients = load_patients_from_csv_files()
+                patients = load_patients_from_csv_files(min_visits=min_visits)
                 N = len(patients)
                 T_max = int(A.shape[2]) if A.ndim == 3 else 0
                 visit_mask_np = np.zeros((N, T_max), dtype=bool)
@@ -518,7 +520,7 @@ def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bo
         return A, X_cov, full_condition_list
     
     # Step 4: Load patient data (full or shard)
-    patients = load_patients_from_csv_files(start_idx=patient_start_idx, end_idx=patient_end_idx)
+    patients = load_patients_from_csv_files(start_idx=patient_start_idx, end_idx=patient_end_idx, min_visits=min_visits)
     
     for patient in patients:
         for visit in patient.visits:
@@ -550,7 +552,7 @@ def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bo
         visit_times = jnp.array(visit_times_np)
 
     # Step 6: Cache the full dataset if it was loaded from scratch
-    if patient_start_idx is None and patient_end_idx is None:
+    if min_visits == 1 and patient_start_idx is None and patient_end_idx is None:
         if not os.path.exists('Data/cached'):
             os.makedirs('Data/cached')
         np.savez(cache_file, A=np.array(A), X_cov=np.array(X_cov))

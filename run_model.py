@@ -441,7 +441,8 @@ def main():
             A, X_cov, condition_list, visit_mask, visit_times = load_data(
                 patient_start_idx=args.start_idx,
                 patient_end_idx=args.end_idx,
-                return_time_meta=True
+                return_time_meta=True,
+                min_visits=2
             )
             if A.ndim != 3:
                 raise ValueError("Temporal model requires 3D A matrix (I, C, T)")
