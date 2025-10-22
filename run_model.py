@@ -97,17 +97,24 @@ def bym_model(L_pat, y):
     # Precision for the unstructured component (i.i.d. noise)
     tau_u = numpyro.sample("tau_u", dist.HalfCauchy(2.0))
     
-    # Hyperprior for delta covariance matrix
-    # Use LKJ prior for correlation matrix and separate scale parameters
-    sigma_delta_scale = numpyro.sample("sigma_delta_scale", dist.HalfCauchy(1.0))
-    delta_corr = numpyro.sample("delta_corr", dist.LKJCholesky(C, concentration=100.0))
+    # Hyperprior for delta covariance matrix with shared variance and structured correlation
+    # Single variance parameter for all conditions
+    sigma_delta = numpyro.sample("sigma_delta", dist.HalfNormal(1.0))
+    # Global correlation strength
+    rho = numpyro.sample("rho", dist.Uniform(-1.0, 1.0))
+    # Condition-specific random effects (variance 0.01 => std 0.1)
+    xi = numpyro.sample("xi", dist.Normal(0.0, jnp.sqrt(0.01)).expand([C]))
     
-    # Construct covariance matrix using NumPyro deterministic operations
-    sigma_delta_vec = numpyro.sample("sigma_delta_vec", dist.InverseGamma(1.0, 1.0).expand([C]))
-    
-    # Convert Cholesky factor to correlation matrix using NumPyro deterministic
-    delta_corr_matrix = numpyro.deterministic("delta_corr_matrix", delta_corr @ delta_corr.T)
-    delta_cov = numpyro.deterministic("delta_cov", jnp.outer(sigma_delta_vec, sigma_delta_vec) * delta_corr_matrix)
+    # Build correlation matrix: R_ij = rho * xi_i * xi_j for i != j; set diagonal to 1
+    outer_xi = jnp.outer(xi, xi)
+    R_off = rho * outer_xi
+    R = R_off.at[jnp.diag_indices(C)].set(1.0)
+    # Clip to [-1, 1] to enforce valid correlation bounds
+    R = jnp.clip(R, -1.0, 1.0)
+    # Expose correlation matrix in samples
+    R = numpyro.deterministic("delta_corr", R)
+    # Construct covariance with small jitter for numerical stability
+    delta_cov = numpyro.deterministic("delta_cov", (sigma_delta ** 2) * (R + 1e-6 * jnp.eye(C)))
 
     # --- Define Latent Patient Field phi using BYM factor approach ---
     
