@@ -105,16 +105,35 @@ def bym_model(L_pat, y):
     # Condition-specific random effects (variance 0.01 => std 0.1)
     xi = numpyro.sample("xi", dist.Normal(0.0, jnp.sqrt(0.01)).expand([C]))
     
-    # Build correlation matrix: R_ij = rho * xi_i * xi_j for i != j; set diagonal to 1
+    # Build raw correlation matrix: R_ij = rho * xi_i * xi_j for i != j; set diagonal to 1
     outer_xi = jnp.outer(xi, xi)
-    R_off = rho * outer_xi
-    R = R_off.at[jnp.diag_indices(C)].set(1.0)
-    # Clip to [-1, 1] to enforce valid correlation bounds
-    R = jnp.clip(R, -1.0, 1.0)
-    # Expose correlation matrix in samples
-    R = numpyro.deterministic("delta_corr", R)
+    R_raw = rho * outer_xi
+    R_raw = R_raw.at[jnp.diag_indices(C)].set(1.0)
+    # Clip raw entries to [-1, 1]
+    R_raw = jnp.clip(R_raw, -1.0, 1.0)
+    # Ensure symmetry
+    R_raw = 0.5 * (R_raw + R_raw.T)
+
+    # Project to nearest SPD and renormalize to correlation
+    # 1) Eigen-decomposition of the symmetric matrix
+    eigvals, eigvecs = jnp.linalg.eigh(R_raw)
+    # 2) Clip eigenvalues to enforce positive definiteness
+    min_eig = 1e-6
+    eigvals_clipped = jnp.clip(eigvals, a_min=min_eig, a_max=None)
+    # 3) Reconstruct SPD matrix
+    R_psd = (eigvecs * eigvals_clipped) @ eigvecs.T
+    # 4) Renormalize to unit diagonal to form a correlation matrix
+    diag_psd = jnp.clip(jnp.diag(R_psd), a_min=min_eig, a_max=None)
+    inv_sqrt_diag = 1.0 / jnp.sqrt(diag_psd)
+    R_corr = (R_psd * inv_sqrt_diag[None, :]) * inv_sqrt_diag[:, None]
+    # 5) Final symmetry and exact unit diagonal
+    R_corr = 0.5 * (R_corr + R_corr.T)
+    R_corr = R_corr.at[jnp.diag_indices(C)].set(1.0)
+
+    # Expose correlation matrix and covariance in samples
+    R_corr = numpyro.deterministic("delta_corr", R_corr)
     # Construct covariance with small jitter for numerical stability
-    delta_cov = numpyro.deterministic("delta_cov", (sigma_delta ** 2) * (R + 1e-6 * jnp.eye(C)))
+    delta_cov = numpyro.deterministic("delta_cov", (sigma_delta ** 2) * (R_corr + 1e-6 * jnp.eye(C)))
 
     # --- Define Latent Patient Field phi using BYM factor approach ---
     
