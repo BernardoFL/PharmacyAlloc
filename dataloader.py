@@ -486,11 +486,35 @@ def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bo
         cached_data = np.load(cache_file)
         A = jnp.array(cached_data['A'])
         X_cov = jnp.array(cached_data['X_cov'])
-        if return_time_meta and os.path.exists(visit_meta_cache):
-            meta = np.load(visit_meta_cache)
-            visit_mask = jnp.array(meta['visit_mask'])
-            visit_times = jnp.array(meta['visit_times'])
-            return A, X_cov, full_condition_list, visit_mask, visit_times
+        if return_time_meta:
+            if os.path.exists(visit_meta_cache):
+                meta = np.load(visit_meta_cache)
+                visit_mask = jnp.array(meta['visit_mask'])
+                visit_times = jnp.array(meta['visit_times'])
+                return A, X_cov, full_condition_list, visit_mask, visit_times
+            else:
+                # Recompute visit metadata from source CSVs to match cached dataset
+                patients = load_patients_from_csv_files()
+                N = len(patients)
+                T_max = int(A.shape[2]) if A.ndim == 3 else 0
+                visit_mask_np = np.zeros((N, T_max), dtype=bool)
+                visit_times_np = np.full((N, T_max), fill_value=-1, dtype=np.int32)
+                for i, patient in enumerate(patients):
+                    for t, visit in enumerate(patient.visits):
+                        if t >= T_max:
+                            break
+                        visit_mask_np[i, t] = True
+                        try:
+                            visit_times_np[i, t] = int(visit.get('viscount', -1))
+                        except Exception:
+                            visit_times_np[i, t] = -1
+                # Save cache for future calls
+                if not os.path.exists('Data/cached'):
+                    os.makedirs('Data/cached')
+                np.savez(visit_meta_cache, visit_mask=visit_mask_np, visit_times=visit_times_np)
+                visit_mask = jnp.array(visit_mask_np)
+                visit_times = jnp.array(visit_times_np)
+                return A, X_cov, full_condition_list, visit_mask, visit_times
         return A, X_cov, full_condition_list
     
     # Step 4: Load patient data (full or shard)
