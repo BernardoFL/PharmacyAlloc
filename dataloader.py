@@ -454,12 +454,13 @@ def get_all_conditions_from_drugs(patients):
 # Example usage:
 # conditions = get_all_conditions_from_drugs(patients)
 # print("Conditions from drugs:", conditions)
-def load_data(patient_start_idx=None, patient_end_idx=None):
+def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bool = False):
     """
     Load and preprocess data, returning JAX arrays.
     Uses cached data if available and no specific patient range is requested.
     """
     cache_file = 'Data/cached/preprocessed_data.npz'
+    visit_meta_cache = 'Data/cached/visit_meta.npz'
     condition_cache = 'Data/cached/condition_list.pkl'
     
     # Step 1: Ensure full condition list is available from cache or by loading all patients
@@ -485,6 +486,11 @@ def load_data(patient_start_idx=None, patient_end_idx=None):
         cached_data = np.load(cache_file)
         A = jnp.array(cached_data['A'])
         X_cov = jnp.array(cached_data['X_cov'])
+        if return_time_meta and os.path.exists(visit_meta_cache):
+            meta = np.load(visit_meta_cache)
+            visit_mask = jnp.array(meta['visit_mask'])
+            visit_times = jnp.array(meta['visit_times'])
+            return A, X_cov, full_condition_list, visit_mask, visit_times
         return A, X_cov, full_condition_list
     
     # Step 4: Load patient data (full or shard)
@@ -502,13 +508,35 @@ def load_data(patient_start_idx=None, patient_end_idx=None):
     # Transform A matrix after all data loading and construction
     A = 2 * A - 1
 
+    # Optionally build visit metadata
+    if return_time_meta:
+        N = len(patients)
+        T_max = int(A.shape[2]) if A.ndim == 3 else 0
+        visit_mask_np = np.zeros((N, T_max), dtype=bool)
+        visit_times_np = np.full((N, T_max), fill_value=-1, dtype=np.int32)
+        for i, patient in enumerate(patients):
+            for t, visit in enumerate(patient.visits):
+                visit_mask_np[i, t] = True
+                # coerce to int (viscount may be float in CSV)
+                try:
+                    visit_times_np[i, t] = int(visit.get('viscount', -1))
+                except Exception:
+                    visit_times_np[i, t] = -1
+        visit_mask = jnp.array(visit_mask_np)
+        visit_times = jnp.array(visit_times_np)
+
     # Step 6: Cache the full dataset if it was loaded from scratch
     if patient_start_idx is None and patient_end_idx is None:
         if not os.path.exists('Data/cached'):
             os.makedirs('Data/cached')
         np.savez(cache_file, A=np.array(A), X_cov=np.array(X_cov))
+        if return_time_meta:
+            np.savez(visit_meta_cache, visit_mask=visit_mask_np, visit_times=visit_times_np)
     
-    return A, X_cov, full_condition_list
+    if return_time_meta:
+        return A, X_cov, full_condition_list, visit_mask, visit_times
+    else:
+        return A, X_cov, full_condition_list
 
 
 if __name__ == '__main__':
