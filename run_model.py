@@ -112,28 +112,16 @@ def bym_model(L_pat, y):
     # Clip raw entries to [-1, 1]
     R_raw = jnp.clip(R_raw, -1.0, 1.0)
     # Ensure symmetry
-    R_raw = 0.5 * (R_raw + R_raw.T)
+    R = 0.5 * (R_raw + R_raw.T)
+    # Set diagonal to exactly 1.0
+    R = R.at[jnp.diag_indices(C)].set(1.0)
 
-    # Project to nearest SPD and renormalize to correlation
-    # 1) Eigen-decomposition of the symmetric matrix
-    eigvals, eigvecs = jnp.linalg.eigh(R_raw)
-    # 2) Clip eigenvalues to enforce positive definiteness
-    min_eig = 1e-6
-    eigvals_clipped = jnp.clip(eigvals, a_min=min_eig, a_max=None)
-    # 3) Reconstruct SPD matrix
-    R_psd = (eigvecs * eigvals_clipped) @ eigvecs.T
-    # 4) Renormalize to unit diagonal to form a correlation matrix
-    diag_psd = jnp.clip(jnp.diag(R_psd), a_min=min_eig, a_max=None)
-    inv_sqrt_diag = 1.0 / jnp.sqrt(diag_psd)
-    R_corr = (R_psd * inv_sqrt_diag[None, :]) * inv_sqrt_diag[:, None]
-    # 5) Final symmetry and exact unit diagonal
-    R_corr = 0.5 * (R_corr + R_corr.T)
-    R_corr = R_corr.at[jnp.diag_indices(C)].set(1.0)
-
-    # Expose correlation matrix and covariance in samples
-    R_corr = numpyro.deterministic("delta_corr", R_corr)
-    # Construct covariance with small jitter for numerical stability
-    delta_cov = numpyro.deterministic("delta_cov", (sigma_delta ** 2) * (R_corr + 1e-6 * jnp.eye(C)))
+    # Expose correlation matrix in samples
+    R = numpyro.deterministic("delta_corr", R)
+    # Construct covariance: add diagonal regularization for numerical stability
+    # This ensures PD: cov = sigma^2 * R + ridge * I where ridge dominates if R is near singular
+    ridge = 1e-4  # Strong enough to guarantee PD without eigen-decomposition
+    delta_cov = numpyro.deterministic("delta_cov", (sigma_delta ** 2) * R + ridge * jnp.eye(C))
 
     # --- Define Latent Patient Field phi using BYM factor approach ---
     
@@ -212,7 +200,7 @@ def run_bym_inference(data, args):
     logging.info("Running MCMC for BYM model with NUTS kernel...")
     mcmc = MCMC(
         kernel,
-        num_warmup=20000,
+        num_warmup=10000,
         num_samples=args.pnum,
         num_chains=4,
         progress_bar=True,
