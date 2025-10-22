@@ -178,7 +178,7 @@ class Patient:
 
 
 
-def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_file="Data/drug_mapping_table.csv", drug_condition_file="Data/drug_condition_atc_table.csv", start_idx=None, end_idx=None, min_visits: int = 1, return_original_indices: bool = False, patient_order_path: str = "Data/patient_order.npy"):
+def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_file="Data/drug_mapping_table.csv", drug_condition_file="Data/drug_condition_atc_table.csv", start_idx=None, end_idx=None, min_visits: int = 1, return_original_indices: bool = False, patient_order_path: str = "Data/patient_order.npy", top_k_by_visits: int = None):
     """
     Constructs a list of Patient objects from three CSV files.
     If start_idx and end_idx are specified, only patients within that range are loaded.
@@ -213,6 +213,10 @@ def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_fil
     
     # Group rows by person_id.
     grouped = list(df_main.groupby('person_id'))
+    # Optionally, restrict to top-K patients by number of visits
+    if top_k_by_visits is not None:
+        grouped.sort(key=lambda item: len(item[1]), reverse=True)
+        grouped = grouped[:int(top_k_by_visits)]
     
     # Slice the grouped data if indices are provided
     if start_idx is not None and end_idx is not None:
@@ -474,7 +478,7 @@ def get_all_conditions_from_drugs(patients):
 # Example usage:
 # conditions = get_all_conditions_from_drugs(patients)
 # print("Conditions from drugs:", conditions)
-def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bool = False, min_visits: int = 1, return_index_map: bool = False):
+def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bool = False, min_visits: int = 1, return_index_map: bool = False, top_k_by_visits: int = None):
     """
     Load and preprocess data, returning JAX arrays.
     Uses cached data if available and no specific patient range is requested.
@@ -502,7 +506,7 @@ def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bo
     global_condition_map = {cond.name: i for i, cond in enumerate(full_condition_list)}
 
     # Step 3: Handle full data caching (only if no shard is specified)
-    if min_visits == 1 and patient_start_idx is None and patient_end_idx is None and os.path.exists(cache_file):
+    if min_visits == 1 and top_k_by_visits is None and patient_start_idx is None and patient_end_idx is None and os.path.exists(cache_file):
         cached_data = np.load(cache_file)
         A = jnp.array(cached_data['A'])
         X_cov = jnp.array(cached_data['X_cov'])
@@ -515,9 +519,9 @@ def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bo
             else:
                 # Recompute visit metadata from source CSVs to match cached dataset
                 if return_index_map:
-                    patients, original_indices = load_patients_from_csv_files(min_visits=min_visits, return_original_indices=True)
+                    patients, original_indices = load_patients_from_csv_files(min_visits=min_visits, return_original_indices=True, top_k_by_visits=top_k_by_visits)
                 else:
-                    patients = load_patients_from_csv_files(min_visits=min_visits)
+                    patients = load_patients_from_csv_files(min_visits=min_visits, top_k_by_visits=top_k_by_visits)
                 N = len(patients)
                 T_max = int(A.shape[2]) if A.ndim == 3 else 0
                 visit_mask_np = np.zeros((N, T_max), dtype=bool)
@@ -542,9 +546,9 @@ def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bo
     
     # Step 4: Load patient data (full or shard)
     if return_index_map:
-        patients, original_indices = load_patients_from_csv_files(start_idx=patient_start_idx, end_idx=patient_end_idx, min_visits=min_visits, return_original_indices=True)
+        patients, original_indices = load_patients_from_csv_files(start_idx=patient_start_idx, end_idx=patient_end_idx, min_visits=min_visits, return_original_indices=True, top_k_by_visits=top_k_by_visits)
     else:
-        patients = load_patients_from_csv_files(start_idx=patient_start_idx, end_idx=patient_end_idx, min_visits=min_visits)
+        patients = load_patients_from_csv_files(start_idx=patient_start_idx, end_idx=patient_end_idx, min_visits=min_visits, top_k_by_visits=top_k_by_visits)
     
     for patient in patients:
         for visit in patient.visits:
@@ -576,7 +580,7 @@ def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bo
         visit_times = jnp.array(visit_times_np)
 
     # Step 6: Cache the full dataset if it was loaded from scratch
-    if min_visits == 1 and patient_start_idx is None and patient_end_idx is None:
+    if min_visits == 1 and top_k_by_visits is None and patient_start_idx is None and patient_end_idx is None:
         if not os.path.exists('Data/cached'):
             os.makedirs('Data/cached')
         np.savez(cache_file, A=np.array(A), X_cov=np.array(X_cov))

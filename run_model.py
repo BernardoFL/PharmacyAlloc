@@ -449,7 +449,8 @@ def main():
                 patient_end_idx=args.end_idx,
                 return_time_meta=True,
                 min_visits=2,
-                return_index_map=True
+                return_index_map=True,
+                top_k_by_visits=500
             )
             if A.ndim != 3:
                 raise ValueError("Temporal model requires 3D A matrix (I, C, T)")
