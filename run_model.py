@@ -450,7 +450,8 @@ def main():
                 return_time_meta=True,
                 min_visits=2,
                 return_index_map=True,
-                top_k_by_visits=500
+                top_k_by_visits=100,
+                max_visits=10
             )
             if A.ndim != 3:
                 raise ValueError("Temporal model requires 3D A matrix (I, C, T)")

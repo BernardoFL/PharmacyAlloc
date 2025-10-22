@@ -478,7 +478,7 @@ def get_all_conditions_from_drugs(patients):
 # Example usage:
 # conditions = get_all_conditions_from_drugs(patients)
 # print("Conditions from drugs:", conditions)
-def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bool = False, min_visits: int = 1, return_index_map: bool = False, top_k_by_visits: int = None):
+def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bool = False, min_visits: int = 1, return_index_map: bool = False, top_k_by_visits: int = None, max_visits: int = None):
     """
     Load and preprocess data, returning JAX arrays.
     Uses cached data if available and no specific patient range is requested.
@@ -515,6 +515,12 @@ def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bo
                 meta = np.load(visit_meta_cache)
                 visit_mask = jnp.array(meta['visit_mask'])
                 visit_times = jnp.array(meta['visit_times'])
+                # Optional truncation of visits
+                if max_visits is not None and A.ndim == 3 and A.shape[2] > max_visits:
+                    A = A[:, :, :max_visits]
+                    X_cov = X_cov[:, :, :max_visits]
+                    visit_mask = visit_mask[:, :max_visits]
+                    visit_times = visit_times[:, :max_visits]
                 return A, X_cov, full_condition_list, visit_mask, visit_times
             else:
                 # Recompute visit metadata from source CSVs to match cached dataset
@@ -541,6 +547,12 @@ def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bo
                 np.savez(visit_meta_cache, visit_mask=visit_mask_np, visit_times=visit_times_np)
                 visit_mask = jnp.array(visit_mask_np)
                 visit_times = jnp.array(visit_times_np)
+                # Optional truncation of visits
+                if max_visits is not None and A.ndim == 3 and A.shape[2] > max_visits:
+                    A = A[:, :, :max_visits]
+                    X_cov = X_cov[:, :, :max_visits]
+                    visit_mask = visit_mask[:, :max_visits]
+                    visit_times = visit_times[:, :max_visits]
                 return A, X_cov, full_condition_list, visit_mask, visit_times
         return A, X_cov, full_condition_list
     
@@ -578,6 +590,14 @@ def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bo
                     visit_times_np[i, t] = -1
         visit_mask = jnp.array(visit_mask_np)
         visit_times = jnp.array(visit_times_np)
+
+    # Optional truncation of visits
+    if max_visits is not None and A.ndim == 3 and A.shape[2] > max_visits:
+        A = A[:, :, :max_visits]
+        X_cov = X_cov[:, :, :max_visits]
+        if return_time_meta:
+            visit_mask = visit_mask[:, :max_visits]
+            visit_times = visit_times[:, :max_visits]
 
     # Step 6: Cache the full dataset if it was loaded from scratch
     if min_visits == 1 and top_k_by_visits is None and patient_start_idx is None and patient_end_idx is None:
