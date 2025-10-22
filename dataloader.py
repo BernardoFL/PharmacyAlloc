@@ -178,7 +178,7 @@ class Patient:
 
 
 
-def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_file="Data/drug_mapping_table.csv", drug_condition_file="Data/drug_condition_atc_table.csv", start_idx=None, end_idx=None, min_visits: int = 1):
+def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_file="Data/drug_mapping_table.csv", drug_condition_file="Data/drug_condition_atc_table.csv", start_idx=None, end_idx=None, min_visits: int = 1, return_original_indices: bool = False, patient_order_path: str = "Data/patient_order.npy"):
     """
     Constructs a list of Patient objects from three CSV files.
     If start_idx and end_idx are specified, only patients within that range are loaded.
@@ -218,7 +218,17 @@ def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_fil
     if start_idx is not None and end_idx is not None:
         grouped = grouped[start_idx:end_idx]
         
-    for person_id, df_patient in grouped:
+    original_indices = []
+    # Optional: map person_id to global index consistent with precomputed KNN ordering
+    person_id_to_global = None
+    if return_original_indices and os.path.exists(patient_order_path):
+        try:
+            patient_order = np.load(patient_order_path, allow_pickle=True)
+            # Build mapping using string keys for robustness
+            person_id_to_global = {str(pid): idx for idx, pid in enumerate(patient_order.tolist())}
+        except Exception:
+            person_id_to_global = None
+    for orig_idx, (person_id, df_patient) in enumerate(grouped):
         visits = []
         # We'll collect conditions for this patient in a dictionary mapping condition name to Condition object.
         patient_conditions_dict = {}
@@ -295,8 +305,16 @@ def load_patients_from_csv_files(main_file="Data/data_table.csv", conversion_fil
             # Create a Patient object with the list of Condition objects.
             patient_obj = Patient(person_id=person_id, visits=visits, conditions=list(patient_conditions_dict.values()))
             patients.append(patient_obj)
+            if return_original_indices:
+                if person_id_to_global is not None and str(person_id) in person_id_to_global:
+                    original_indices.append(int(person_id_to_global[str(person_id)]))
+                else:
+                    original_indices.append(orig_idx)
     
-    return patients
+    if return_original_indices:
+        return patients, original_indices
+    else:
+        return patients
 
 def construct_A_matrix(patients: List[Patient], global_condition_map: Dict[str, int] = None) -> Tuple[jnp.ndarray, Dict[str, int]]:
     """
@@ -456,7 +474,7 @@ def get_all_conditions_from_drugs(patients):
 # Example usage:
 # conditions = get_all_conditions_from_drugs(patients)
 # print("Conditions from drugs:", conditions)
-def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bool = False, min_visits: int = 1):
+def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bool = False, min_visits: int = 1, return_index_map: bool = False):
     """
     Load and preprocess data, returning JAX arrays.
     Uses cached data if available and no specific patient range is requested.
@@ -496,7 +514,10 @@ def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bo
                 return A, X_cov, full_condition_list, visit_mask, visit_times
             else:
                 # Recompute visit metadata from source CSVs to match cached dataset
-                patients = load_patients_from_csv_files(min_visits=min_visits)
+                if return_index_map:
+                    patients, original_indices = load_patients_from_csv_files(min_visits=min_visits, return_original_indices=True)
+                else:
+                    patients = load_patients_from_csv_files(min_visits=min_visits)
                 N = len(patients)
                 T_max = int(A.shape[2]) if A.ndim == 3 else 0
                 visit_mask_np = np.zeros((N, T_max), dtype=bool)
@@ -520,7 +541,10 @@ def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bo
         return A, X_cov, full_condition_list
     
     # Step 4: Load patient data (full or shard)
-    patients = load_patients_from_csv_files(start_idx=patient_start_idx, end_idx=patient_end_idx, min_visits=min_visits)
+    if return_index_map:
+        patients, original_indices = load_patients_from_csv_files(start_idx=patient_start_idx, end_idx=patient_end_idx, min_visits=min_visits, return_original_indices=True)
+    else:
+        patients = load_patients_from_csv_files(start_idx=patient_start_idx, end_idx=patient_end_idx, min_visits=min_visits)
     
     for patient in patients:
         for visit in patient.visits:
@@ -560,8 +584,12 @@ def load_data(patient_start_idx=None, patient_end_idx=None, return_time_meta: bo
             np.savez(visit_meta_cache, visit_mask=visit_mask_np, visit_times=visit_times_np)
     
     if return_time_meta:
+        if return_index_map:
+            return A, X_cov, full_condition_list, visit_mask, visit_times, jnp.array(original_indices, dtype=jnp.int32)
         return A, X_cov, full_condition_list, visit_mask, visit_times
     else:
+        if return_index_map:
+            return A, X_cov, full_condition_list, jnp.array(original_indices, dtype=jnp.int32)
         return A, X_cov, full_condition_list
 
 

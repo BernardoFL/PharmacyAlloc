@@ -226,7 +226,13 @@ def run_bym_ou_inference(data_3d, visit_mask, visit_times, args):
     # Build patient Laplacian from KNN (same as BYM) using all I patients
     logging.info("Building patient graph Laplacian...")
     patient_knn = load_patient_knn(lazy_load=True)
-    knn_indices = patient_knn['indices'][:I, 1:11]
+    # If a mapping of filtered patients to global indices exists in visit_times' metadata,
+    # we cannot access it here; instead, ensure indices we use are valid for the filtered set by remapping.
+    # Build a local KNN by selecting neighbors among the first I indices of the global KNN and clipping to range.
+    global_indices = patient_knn['indices']
+    # Build a mask of valid neighbor indices (< I). Exclude self (first column) later.
+    trimmed = np.where(global_indices < I, global_indices, 0)
+    knn_indices = trimmed[:I, 1:11]
     n_patients = I
     rows = np.arange(n_patients).repeat(knn_indices.shape[1])
     cols = knn_indices.flatten()
@@ -438,11 +444,12 @@ def main():
             post_samples, times_post, beta_opt, time_bootstrap = run_bym_inference(gmrf_data, args)
         else:
             logging.info("Loading data for BYM-OU (temporal) model with visit metadata...")
-            A, X_cov, condition_list, visit_mask, visit_times = load_data(
+            A, X_cov, condition_list, visit_mask, visit_times, original_indices = load_data(
                 patient_start_idx=args.start_idx,
                 patient_end_idx=args.end_idx,
                 return_time_meta=True,
-                min_visits=2
+                min_visits=2,
+                return_index_map=True
             )
             if A.ndim != 3:
                 raise ValueError("Temporal model requires 3D A matrix (I, C, T)")
